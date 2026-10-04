@@ -1,0 +1,10 @@
+#!/bin/sh
+# Runs Maven in Docker, so a machine without a JDK can build and test.
+# Integration tests start containers through the host's Docker socket, and
+# reach them through the host's gateway.
+exec docker run --rm \
+  -v "$PWD":/w -w /w \
+  -v "$HOME/.m2":/root/.m2 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal \
+  maven:3.9-eclipse-temurin-17 mvn -B "$@"
