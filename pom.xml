@@ -12,6 +12,10 @@
     <maven.compiler.release>17</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <kafka.version>3.8.0</kafka.version>
+    <!-- Integration and release tests run only in their profiles, so
+         `mvn verify` alone is the unit layer and packaging. -->
+    <skipITs>true</skipITs>
+    <it.includes>none</it.includes>
   </properties>
 
   <dependencies>
@@ -58,7 +62,13 @@
     <dependency>
       <groupId>org.testcontainers</groupId>
       <artifactId>testcontainers</artifactId>
-      <version>1.20.6</version>
+      <version>2.0.5</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-kafka</artifactId>
+      <version>2.0.5</version>
       <scope>test</scope>
     </dependency>
     <dependency>
@@ -81,6 +91,11 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-failsafe-plugin</artifactId>
         <version>3.5.2</version>
+        <configuration>
+          <includes>
+            <include>${it.includes}</include>
+          </includes>
+        </configuration>
         <executions>
           <execution>
             <goals>
@@ -104,4 +119,21 @@
       </plugin>
     </plugins>
   </build>
+
+  <profiles>
+    <profile>
+      <id>integration</id>
+      <properties>
+        <skipITs>false</skipITs>
+        <it.includes>**/*IntegrationIT.java</it.includes>
+      </properties>
+    </profile>
+    <profile>
+      <id>release</id>
+      <properties>
+        <skipITs>false</skipITs>
+        <it.includes>**/*ReleaseIT.java</it.includes>
+      </properties>
+    </profile>
+  </profiles>
 </project>
