@@ -16,10 +16,10 @@ import java.util.Map;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
 
-class BundleSchemaTest {
+public class BundleSchemaTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    static Set<ValidationMessage> validate(String json) throws Exception {
+    public static Set<ValidationMessage> validate(String json) throws Exception {
         try (InputStream in = BundleSchemaTest.class.getResourceAsStream("/schema/bundle.schema.json")) {
             JsonSchema schema = JsonSchemaFactory.getInstance(SpecVersion.VersionFlag.V202012).getSchema(in);
             return schema.validate(MAPPER.readTree(json));
