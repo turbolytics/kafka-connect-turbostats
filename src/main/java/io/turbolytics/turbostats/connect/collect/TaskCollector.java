@@ -179,6 +179,14 @@ public final class TaskCollector {
         Optional<TaskCounters.Snapshot> counters = TaskCounters.find(k).map(TaskCounters::snapshot)
                 .filter(s -> (sink ? s.consumerStarts() : s.producerStarts()) > 0);
         Seen prev = seen.get(k);
+        long starts = counters.map(c -> sink ? c.consumerStarts() : c.producerStarts()).orElse(0L);
+        long startMillis = counters.map(c -> sink ? c.lastConsumerStartMillis() : c.lastProducerStartMillis()).orElse(0L);
+        // Work already counted on the first report happened no earlier than
+        // the task's start, or the worker's when the task's is unknown. A
+        // counter compared only between reports otherwise never dates work
+        // done before the second report, and a snapshot that finished in the
+        // first interval read as a task that never worked.
+        Instant earliest = starts > 0 ? Instant.ofEpochMilli(startMillis) : jvm.startedAt();
 
         long accepted;
         long written;
@@ -191,7 +199,7 @@ public final class TaskCollector {
             // every flush interval while the destination is down.
             written = Math.max(0, input.getAsLong() - active);
             lastWrite = changedAt(prev == null ? null : prev.written(), prev == null ? null : prev.writtenChangedAt(),
-                    written, now);
+                    written, now, earliest);
         } else {
             // source-record-write-total counts acknowledged batches (Connect
             // records it in the producer callback), so it is the fallback for
@@ -224,7 +232,7 @@ public final class TaskCollector {
         }
 
         Instant inputChangedAt = changedAt(prev == null ? null : prev.input(), prev == null ? null : prev.inputChangedAt(),
-                input.getAsLong(), now);
+                input.getAsLong(), now, earliest);
         seen.put(k, new Seen(input.getAsLong(), inputChangedAt, written, lastWrite == null && sink ? null : lastWrite,
                 sink ? 0 : connectOut.getAsLong(), counters.map(TaskCounters.Snapshot::acked).orElse(0L)));
 
@@ -263,8 +271,6 @@ public final class TaskCollector {
                 ReporterVersion.get(),
                 config.labels());
 
-        long starts = counters.map(s -> sink ? s.consumerStarts() : s.producerStarts()).orElse(0L);
-        long startMillis = counters.map(s -> sink ? s.lastConsumerStartMillis() : s.lastProducerStartMillis()).orElse(0L);
         Pipeline pipeline = new Pipeline(
                 state(h.state()),
                 starts > 0 ? Instant.ofEpochMilli(startMillis) : null,
@@ -307,10 +313,15 @@ public final class TaskCollector {
         return fresh;
     }
 
-    /** When a counter last rose, as this reporter saw it: accurate to one interval. */
-    private static Instant changedAt(Long before, Instant beforeAt, long current, Instant now) {
+    /**
+     * When a counter last rose, as this reporter saw it: accurate to one
+     * interval. On the first report a non-zero counter rose at some point
+     * since earliest, and earliest is the conservative answer: it can make a
+     * task look idle sooner, never fresher than it is.
+     */
+    private static Instant changedAt(Long before, Instant beforeAt, long current, Instant now, Instant earliest) {
         if (before == null) {
-            return null;
+            return current > 0 ? earliest : null;
         }
         return current > before ? now : beforeAt;
     }

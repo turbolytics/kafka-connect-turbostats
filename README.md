@@ -33,11 +33,13 @@ If the worker already sets interceptor classes, add these to its list, comma-sep
 | `turbostats.report.to` | none: reporting is off | Where reports go. `https`, or `http` to the loopback only. |
 | `turbostats.key` | none | The `sfc_` credential. Supply it through a config provider, never in plain text. |
 | `turbostats.cluster` | the worker's `group.id` | The first part of every instance id. Set it when `group.id` is a stock value such as `connect-cluster`. |
-| `turbostats.interval.seconds` | 60 | How often each task reports. |
+| `turbostats.interval.seconds` | 60 | How often each task reports. TurboStats Control accepts at most two reports a minute per task, so keep it at 30 or more. |
 | `turbostats.timeout.seconds` | 10 | How long one report may take. Less than the interval. |
 | `turbostats.label.<key>` | none | Your own labels: at most 10, keys `[a-z][a-z0-9_]*`. |
 
 A bad setting turns reporting off and logs why. It never stops the worker or a connector.
+
+In the Debezium image, removing a `CONNECT_TURBOSTATS_*` variable does not remove the setting. The image appends each variable to the worker's properties file in the `/kafka/config` volume, and the volume survives a container recreate. Recreate with `docker compose up --force-recreate --renew-anon-volumes`, or edit the file.
 
 At startup the worker logs `reporting every 60s to … as Credential(<key id>)`. If that key id does not match the one your dashboard shows for the key, the JVM's crypto provider derived a different key from the credential; FIPS-mode and non-OpenJDK providers can.
 

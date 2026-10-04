@@ -410,4 +410,48 @@ class TaskCollectorTest {
             assertEquals(java.util.Set.of(), BundleSchemaTest.validate(b.toJson()), b.toJson());
         }
     }
+
+    // Live against Control, a snapshot finished before the second report,
+    // so the input never rose between two reports and the task read as never
+    // having worked. Work seen on the first report happened no earlier than
+    // the task's start.
+    @Test
+    void workBeforeTheFirstReportDatesFromTheTaskStart() {
+        AckInterceptor ack = new AckInterceptor();
+        ack.configure(Map.of("client.id", "connector-producer-inventory-cdc-0"));
+        long start = TaskCounters.find(SRC).orElseThrow().snapshot().lastProducerStartMillis();
+        runningSource(20000, 20000, 0);
+        Bundle b = collector().collect(NOW).get(0);
+        assertEquals(Instant.ofEpochMilli(start), b.pipeline().lastMessageAt());
+        assertEquals(Instant.ofEpochMilli(start), b.lastActivityAt());
+    }
+
+    // Without the interceptor's start time, the worker's start is the
+    // earliest the work can have happened.
+    @Test
+    void withoutATaskStartWorkDatesFromTheWorkerStart() {
+        runningSource(20000, 20000, 0);
+        Bundle b = collector().collect(NOW).get(0);
+        assertEquals(Fixtures.process().startedAt(), b.pipeline().lastMessageAt());
+    }
+
+    @Test
+    void noWorkYetIsStillAbsent() {
+        runningSource(0, 0, 0);
+        assertNull(collector().collect(NOW).get(0).pipeline().lastMessageAt());
+    }
+
+    // A sink that finished its rows before the second report wrote them; its
+    // last write dates from no earlier than the worker's start.
+    @Test
+    void aSinksWritesBeforeTheFirstReportDateFromTheStart() {
+        jmx.put(SNK_TASK, "status", "running")
+                .put(SNK_METRICS, "sink-record-read-total", 1000.0)
+                .put(SNK_METRICS, "sink-record-send-total", 1000.0)
+                .put(SNK_METRICS, "sink-record-active-count", 0.0);
+        cluster.tasks.put(SNK, new TaskHealth("RUNNING", "10.0.3.8:8083", "sink"));
+        cluster.connectorStates.put("customers-sink", "RUNNING");
+        Bundle b = collector().collect(NOW).get(0);
+        assertEquals(Fixtures.process().startedAt(), b.pipeline().lastSinkWriteAt());
+    }
 }
