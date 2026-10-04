@@ -1,6 +1,7 @@
 package io.turbolytics.turbostats.connect.report;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.turbolytics.turbostats.connect.wire.Bundle;
 import io.turbolytics.turbostats.connect.wire.Fixtures;
@@ -81,9 +82,40 @@ class ReporterTest {
             r.tick();
         }
         assertEquals(1, log.warns.size());
+        // Recovered only after a run of clean ticks, not the first.
         s.status = 200;
         r.tick();
+        r.tick();
+        assertEquals(0, log.infos.size());
+        r.tick();
         assertEquals(1, log.infos.size());
+    }
+
+    // Live against Control, a 15 s interval met a two-a-minute limit: every
+    // other tick was refused, and the log said failing, recovered, failing,
+    // 105 lines in two hours. A receiver that refuses every other tick is
+    // still failing.
+    @Test
+    void alternatingRefusalsDoNotFlapTheLog() {
+        StubSender s = new StubSender();
+        RecordingLog log = new RecordingLog();
+        Reporter r = new Reporter(() -> List.of(Fixtures.sourceBundle()), s, log, CLOCK);
+        for (int i = 0; i < 10; i++) {
+            s.status = i % 2 == 0 ? 429 : 200;
+            r.tick();
+        }
+        assertEquals(1, log.warns.size());
+        assertEquals(0, log.infos.size());
+    }
+
+    // A 429 is the receiver's rate limit. The warning says what to change.
+    @Test
+    void aRateLimitNamesTheInterval() {
+        StubSender s = new StubSender();
+        s.status = 429;
+        RecordingLog log = new RecordingLog();
+        new Reporter(() -> List.of(Fixtures.sourceBundle()), s, log, CLOCK).tick();
+        assertTrue(log.warns.get(0).contains("turbostats.interval.seconds"), log.warns.get(0));
     }
 
     // A receiver that accepts some bundles and refuses others is failing,

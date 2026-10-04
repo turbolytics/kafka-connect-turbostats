@@ -29,6 +29,10 @@ public final class Reporter {
     private final Clock clock;
     private final AtomicBoolean inFlight = new AtomicBoolean();
     private volatile boolean failing;
+    private int cleanTicks;
+
+    /** Clean ticks in a row before failing is declared over. */
+    static final int RECOVERY_TICKS = 3;
 
     public Reporter(Supplier<List<Bundle>> collect, Sender.Port sender, Log log, Clock clock) {
         this.collect = collect;
@@ -56,6 +60,10 @@ public final class Reporter {
                 posts.add(sender.send(b, now).handle((status, err) -> {
                     if (err != null) {
                         return "posting failed: " + err.getClass().getSimpleName();
+                    }
+                    if (status == 429) {
+                        return "receiver answered 429: reports arrive faster than it accepts them;"
+                                + " raise turbostats.interval.seconds";
                     }
                     if (status < 200 || status >= 300) {
                         return "receiver answered " + status;
@@ -89,6 +97,7 @@ public final class Reporter {
     }
 
     private synchronized void fail(String why) {
+        cleanTicks = 0;
         if (!failing) {
             failing = true;
             log.warn("turbostats reporting is failing: " + why);
@@ -97,9 +106,19 @@ public final class Reporter {
         }
     }
 
+    /**
+     * Recovered only after RECOVERY_TICKS clean ticks in a row. A receiver
+     * that refuses every other tick, as a rate limit does, is still failing;
+     * declaring recovery on each clean tick logged a warning and a recovery
+     * every interval.
+     */
     private synchronized void succeed() {
-        if (failing) {
+        if (!failing) {
+            return;
+        }
+        if (++cleanTicks >= RECOVERY_TICKS) {
             failing = false;
+            cleanTicks = 0;
             log.info("turbostats reporting recovered");
         }
     }
