@@ -62,4 +62,16 @@ class SignerTest {
         String shortSeed = "sfc_" + Base64.getUrlEncoder().withoutPadding().encodeToString(new byte[16]);
         assertThrows(IllegalArgumentException.class, () -> Credential.parse(shortSeed));
     }
+
+    // The config hash key derives from the credential: stable for one
+    // install, different across installs, and never the seed itself.
+    @Test
+    void theConfigHashKeyIsStableAndNotTheSeed() throws Exception {
+        String key = vectors().get("credential").asText();
+        byte[] k1 = Credential.parse(key).configHashKey();
+        byte[] k2 = Credential.parse(key).configHashKey();
+        assertEquals(HexFormat.of().formatHex(k1), HexFormat.of().formatHex(k2));
+        assertFalse(HexFormat.of().formatHex(k1).equals(vectors().get("seed_hex").asText()));
+        assertEquals(32, k1.length);
+    }
 }

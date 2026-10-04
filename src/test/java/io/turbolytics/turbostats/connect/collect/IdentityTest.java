@@ -36,16 +36,22 @@ class IdentityTest {
         assertNull(Identity.typeOf(null));
     }
 
+    static final byte[] KEY_A = "install-a".getBytes();
+    static final byte[] KEY_B = "install-b".getBytes();
+
     // The hash changes with any setting and never carries one: a connector's
-    // config holds its database password in plain text.
+    // config holds its database password in plain text. It is keyed by the
+    // install's credential, so it means nothing outside that install and
+    // cannot be checked against a guessed password.
     @Test
-    void theConfigHashIsStableAndRevealsNothing() {
+    void theConfigHashIsStableKeyedAndRevealsNothing() {
         Map<String, String> a = new HashMap<>(Map.of("connector.class", "x", "database.password", "hunter2"));
         Map<String, String> b = new HashMap<>(Map.of("database.password", "hunter2", "connector.class", "x"));
-        assertEquals(Identity.configHash(a), Identity.configHash(b));
-        assertTrue(Identity.configHash(a).startsWith("sha256:"));
-        assertTrue(!Identity.configHash(a).contains("hunter2"));
+        assertEquals(Identity.configHash(a, KEY_A), Identity.configHash(b, KEY_A));
+        assertTrue(Identity.configHash(a, KEY_A).startsWith("hmac-sha256:"));
+        assertTrue(!Identity.configHash(a, KEY_A).contains("hunter2"));
+        assertNotEquals(Identity.configHash(a, KEY_A), Identity.configHash(a, KEY_B));
         b.put("database.password", "hunter3");
-        assertNotEquals(Identity.configHash(a), Identity.configHash(b));
+        assertNotEquals(Identity.configHash(a, KEY_A), Identity.configHash(b, KEY_A));
     }
 }

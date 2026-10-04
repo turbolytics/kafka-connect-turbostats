@@ -18,7 +18,9 @@ import java.util.function.Supplier;
  * flight is skipped: a hung receiver delays neither the worker nor the next
  * collection. Failures log one warning when they begin and one info line
  * when they end, as SQLFlow's reporter does; an unregistered key fails
- * forever, and a line per attempt would bury the worker's log.
+ * forever, and a line per attempt would bury the worker's log. A tick with
+ * any failed post is a failing tick, so a receiver that refuses some
+ * bundles does not flap the log between the two.
  */
 public final class Reporter {
     private final Supplier<List<Bundle>> collect;
@@ -47,21 +49,39 @@ public final class Reporter {
         }
         try {
             Instant now = clock.instant();
-            List<CompletableFuture<Integer>> posts = new ArrayList<>();
+            List<CompletableFuture<String>> posts = new ArrayList<>();
             for (Bundle b : collect.get()) {
+                // Each post resolves to null on success or to why it failed,
+                // so the tick decides failing or recovered once, not per post.
                 posts.add(sender.send(b, now).handle((status, err) -> {
                     if (err != null) {
-                        fail("posting failed: " + err.getClass().getSimpleName());
-                    } else if (status < 200 || status >= 300) {
-                        fail("receiver answered " + status);
-                    } else {
-                        succeed();
+                        return "posting failed: " + err.getClass().getSimpleName();
                     }
-                    return status;
+                    if (status < 200 || status >= 300) {
+                        return "receiver answered " + status;
+                    }
+                    return null;
                 }));
             }
-            CompletableFuture.allOf(posts.toArray(new CompletableFuture[0]))
-                    .whenComplete((v, e) -> inFlight.set(false));
+            CompletableFuture.allOf(posts.toArray(new CompletableFuture[0])).whenComplete((v, e) -> {
+                try {
+                    String why = null;
+                    for (CompletableFuture<String> p : posts) {
+                        String r = p.getNow(null);
+                        if (r != null) {
+                            why = r;
+                            break;
+                        }
+                    }
+                    if (why != null) {
+                        fail(why);
+                    } else if (!posts.isEmpty()) {
+                        succeed();
+                    }
+                } finally {
+                    inFlight.set(false);
+                }
+            });
         } catch (Throwable t) {
             fail("collecting failed: " + t.getClass().getSimpleName() + ": " + t.getMessage());
             inFlight.set(false);

@@ -7,8 +7,8 @@ import java.util.Optional;
 public interface ClusterView {
     Optional<TaskHealth> task(TaskKey k);
 
-    /** The connector's state, such as RUNNING or STOPPED; empty when it was deleted. */
-    Optional<String> connectorState(String connector);
+    /** The connector's state, or whether it was not found, or no answer. */
+    ConnectorLookup connector(String connector);
 
     /** The connector's config, empty when unknown. Holds secrets: hash it, never send it. */
     Map<String, String> config(String connector);

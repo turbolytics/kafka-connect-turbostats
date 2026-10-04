@@ -241,7 +241,7 @@ class WorkerReleaseIT {
         assertEquals("kafka-connect", b.at("/instance/runtime").asText());
         assertEquals("postgres", b.at("/instance/source_type").asText());
         assertEquals("itest", b.at("/instance/labels/env").asText());
-        assertTrue(b.at("/instance/config_hash").asText().startsWith("sha256:"));
+        assertTrue(b.at("/instance/config_hash").asText().startsWith("hmac-sha256:"));
         assertTrue(!post.get("raw").asText().contains("\"postgres\",\"database.password"));
         assertEquals("jvm", b.at("/process/memory/runtime").asText());
         assertTrue(!b.get("pipeline").has("sink_flush_count"));

@@ -3,6 +3,7 @@ package io.turbolytics.turbostats.connect.collect;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import org.apache.kafka.connect.errors.NotFoundException;
 import org.apache.kafka.connect.health.ConnectClusterState;
 import org.apache.kafka.connect.health.ConnectorHealth;
 import org.apache.kafka.connect.health.TaskState;
@@ -34,12 +35,19 @@ public final class ConnectClusterView implements ClusterView {
         }
     }
 
+    /**
+     * Only NotFoundException means deleted. Anything else, a herder timeout
+     * or a rebalance race, is no answer: reading it as deleted would send a
+     * final exit for a connector that is fine.
+     */
     @Override
-    public Optional<String> connectorState(String connector) {
+    public ConnectorLookup connector(String connector) {
         try {
-            return Optional.of(state.connectorHealth(connector).connectorState().state());
+            return ConnectorLookup.of(state.connectorHealth(connector).connectorState().state());
+        } catch (NotFoundException e) {
+            return ConnectorLookup.notFound();
         } catch (Throwable e) {
-            return Optional.empty();
+            return ConnectorLookup.unknown();
         }
     }
 

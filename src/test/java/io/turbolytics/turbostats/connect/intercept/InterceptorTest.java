@@ -50,10 +50,19 @@ class InterceptorTest {
         AckInterceptor second = producerFor("connector-producer-inventory-cdc-0");
         producerFor("connector-producer-inventory-cdc-0");
         TaskCounters.Snapshot s = TaskCounters.find(SOURCE).orElseThrow().snapshot();
-        assertEquals(3, s.starts());
+        assertEquals(3, s.producerStarts());
         assertEquals(0, s.acked());
         second.onAcknowledgement(null, null);
         assertEquals(1, TaskCounters.find(SOURCE).orElseThrow().snapshot().acked());
+    }
+
+    // Sent is what the task handed the producer, before the broker answers.
+    @Test
+    void countsSends() {
+        AckInterceptor i = producerFor("connector-producer-inventory-cdc-0");
+        i.onSend(null);
+        i.onSend(null);
+        assertEquals(2, TaskCounters.find(SOURCE).orElseThrow().snapshot().sent());
     }
 
     // The worker's own producers and the DLQ producer pass through untouched.
@@ -85,7 +94,7 @@ class InterceptorTest {
         assertEquals(0, TaskCounters.find(SINK).orElseThrow().snapshot().lastBatchMillis());
         c.onConsume(new ConsumerRecords<>(Map.of(tp, List.of(new ConsumerRecord<>("t", 0, 0L, "k", "v")))));
         TaskCounters.Snapshot s = TaskCounters.find(SINK).orElseThrow().snapshot();
-        assertEquals(1, s.starts());
+        assertEquals(1, s.consumerStarts());
         assertTrue(s.lastBatchMillis() > 0);
     }
 }

@@ -2,11 +2,12 @@ package io.turbolytics.turbostats.connect.collect;
 
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
-import java.security.MessageDigest;
 import java.util.HexFormat;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 
 /** The instance fields the reporter derives rather than reads from settings. */
 public final class Identity {
@@ -61,16 +62,20 @@ public final class Identity {
     }
 
     /**
-     * sha256 over the sorted key=value lines. The config carries secrets in
-     * plain text, so only the hash leaves the worker; it still changes when
-     * any setting does, which is what a receiver needs.
+     * HMAC-SHA256 over the sorted key=value lines, keyed by the install's
+     * credential. The config carries secrets in plain text, so only the hash
+     * leaves the worker; it still changes when any setting does, which is
+     * what a receiver needs. Keyed, it means nothing outside this install,
+     * and nobody without the credential can test a guessed password
+     * against it.
      */
-    public static String configHash(Map<String, String> config) {
+    public static String configHash(Map<String, String> config, byte[] key) {
         StringBuilder b = new StringBuilder();
         new TreeMap<>(config).forEach((k, v) -> b.append(k).append('=').append(v).append('\n'));
         try {
-            byte[] sum = MessageDigest.getInstance("SHA-256").digest(b.toString().getBytes(StandardCharsets.UTF_8));
-            return "sha256:" + HexFormat.of().formatHex(sum);
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(key, "HmacSHA256"));
+            return "hmac-sha256:" + HexFormat.of().formatHex(mac.doFinal(b.toString().getBytes(StandardCharsets.UTF_8)));
         } catch (GeneralSecurityException e) {
             throw new IllegalStateException(e);
         }

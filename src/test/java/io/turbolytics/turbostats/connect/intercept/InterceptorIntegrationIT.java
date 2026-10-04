@@ -67,7 +67,8 @@ class InterceptorIntegrationIT {
             p.flush();
         }
         TaskCounters.Snapshot s = TaskCounters.find(new TaskKey("it-cdc", 0)).orElseThrow().snapshot();
-        assertEquals(1, s.starts());
+        assertEquals(1, s.producerStarts());
+        assertEquals(500, s.sent());
         assertEquals(500, s.acked());
         assertTrue(s.lastAckMillis() > 0);
     }
@@ -84,7 +85,7 @@ class InterceptorIntegrationIT {
             p.flush();
         }
         TaskCounters.Snapshot s = TaskCounters.find(new TaskKey("it-restart", 0)).orElseThrow().snapshot();
-        assertEquals(2, s.starts());
+        assertEquals(2, s.producerStarts());
         assertEquals(0, s.acked());
     }
 
@@ -108,7 +109,7 @@ class InterceptorIntegrationIT {
             }
         }
         TaskCounters.Snapshot s = TaskCounters.find(new TaskKey("it-sink", 0)).orElseThrow().snapshot();
-        assertEquals(1, s.starts());
+        assertEquals(1, s.consumerStarts());
         assertTrue(s.lastBatchMillis() > 0);
     }
 }

@@ -86,6 +86,27 @@ class ReporterTest {
         assertEquals(1, log.infos.size());
     }
 
+    // A receiver that accepts some bundles and refuses others is failing,
+    // once: the log must not flap between warning and recovery every tick.
+    @Test
+    void aPartlyRefusingReceiverDoesNotFlap() {
+        RecordingLog log = new RecordingLog();
+        Sender.Port mixed = new Sender.Port() {
+            int n;
+
+            @Override
+            public CompletableFuture<Integer> send(Bundle b, Instant now) {
+                return CompletableFuture.completedFuture(n++ % 2 == 0 ? 200 : 429);
+            }
+        };
+        Reporter r = new Reporter(() -> List.of(Fixtures.sourceBundle(), Fixtures.sinkBundle()), mixed, log, CLOCK);
+        for (int i = 0; i < 5; i++) {
+            r.tick();
+        }
+        assertEquals(1, log.warns.size());
+        assertEquals(0, log.infos.size());
+    }
+
     // A collector that throws must not kill the scheduled thread, or
     // reporting stops for the life of the worker.
     @Test

@@ -7,13 +7,16 @@ import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
 
 /**
- * Counts each source task's acknowledged records.
+ * Counts each source task's sends and acknowledgments, and when it last
+ * had one acknowledged.
  *
- * Connect's source-record-write-total counts when a record is sent, before
- * the broker has it; onAcknowledgement is the only per-record
- * acknowledgment the worker exposes. This runs on the producer's I/O
- * thread for every record: one increment, no allocation, and no exception
- * may escape, because a failing interceptor fails the task.
+ * Sends are what the task handed the producer; acknowledgments are what
+ * the broker has. Connect's source-record-write-total counts per
+ * acknowledged batch, so only this sees records sent and not yet
+ * acknowledged, and the exact time of the last acknowledgment. Runs on the
+ * task's and the producer's threads for every record: one increment, no
+ * allocation, and no exception may escape, because a failing interceptor
+ * fails the task.
  */
 public final class AckInterceptor implements ProducerInterceptor<Object, Object> {
     private volatile TaskCounters counters;
@@ -24,7 +27,7 @@ public final class AckInterceptor implements ProducerInterceptor<Object, Object>
             Object id = configs == null ? null : configs.get("client.id");
             TaskKey.fromClientId(id == null ? null : String.valueOf(id)).ifPresent(k -> {
                 TaskCounters c = TaskCounters.of(k);
-                c.started(System.currentTimeMillis());
+                c.producerStarted(System.currentTimeMillis());
                 counters = c;
             });
         } catch (Throwable ignored) {
@@ -34,6 +37,14 @@ public final class AckInterceptor implements ProducerInterceptor<Object, Object>
 
     @Override
     public ProducerRecord<Object, Object> onSend(ProducerRecord<Object, Object> record) {
+        try {
+            TaskCounters c = counters;
+            if (c != null) {
+                c.sent();
+            }
+        } catch (Throwable ignored) {
+            // Never fail the task over a monitoring counter.
+        }
         return record;
     }
 

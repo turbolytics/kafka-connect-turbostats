@@ -31,19 +31,32 @@ class TaskCollectorTest {
     static class Cluster implements ClusterView {
         final Map<TaskKey, TaskHealth> tasks = new HashMap<>();
         final Map<String, String> connectorStates = new HashMap<>();
+        final java.util.Set<String> unreachable = new java.util.HashSet<>();
+        final java.util.Set<TaskKey> throwing = new java.util.HashSet<>();
+        boolean configUnavailable;
 
         @Override
         public Optional<TaskHealth> task(TaskKey k) {
+            if (throwing.contains(k)) {
+                throw new IllegalStateException("boom");
+            }
             return Optional.ofNullable(tasks.get(k));
         }
 
         @Override
-        public Optional<String> connectorState(String connector) {
-            return Optional.ofNullable(connectorStates.get(connector));
+        public ConnectorLookup connector(String connector) {
+            if (unreachable.contains(connector)) {
+                return ConnectorLookup.unknown();
+            }
+            String state = connectorStates.get(connector);
+            return state == null ? ConnectorLookup.notFound() : ConnectorLookup.of(state);
         }
 
         @Override
         public Map<String, String> config(String connector) {
+            if (configUnavailable) {
+                return Map.of();
+            }
             return Map.of("connector.class", connector.equals("customers-sink")
                     ? "io.debezium.connector.jdbc.JdbcSinkConnector"
                     : "io.debezium.connector.postgresql.PostgresConnector");
@@ -101,10 +114,13 @@ class TaskCollectorTest {
         new AckInterceptor().configure(Map.of("client.id", "connector-producer-inventory-cdc-0"));
         AckInterceptor ack = new AckInterceptor();
         ack.configure(Map.of("client.id", "connector-producer-inventory-cdc-0"));
+        for (int i = 0; i < 50; i++) {
+            ack.onSend(null);
+        }
         for (int i = 0; i < 40; i++) {
             ack.onAcknowledgement(null, null);
         }
-        runningSource(50, 50, 10);
+        runningSource(50, 40, 10);
 
         Bundle b = collector().collect(NOW).get(0);
         assertEquals("prod-connect/inventory-cdc/0", b.instance().id());
@@ -115,6 +131,8 @@ class TaskCollectorTest {
         assertEquals("10.0.3.7:8083", b.process().host());
         assertEquals("running", b.pipeline().state());
         assertEquals(50, b.pipeline().messageCount());
+        // Accepted is what the task handed the producer; written is what the
+        // broker acknowledged.
         assertEquals(50, b.pipeline().sinkRowsAccepted());
         assertEquals(40, b.pipeline().sinkRowsWritten());
         assertNull(b.pipeline().sinkFlushCount());
@@ -123,13 +141,16 @@ class TaskCollectorTest {
         assertTrue(b.pipeline().lastSinkWriteAt() != null);
     }
 
-    // Without the interceptor's counts, written is records written less
-    // records in flight, and there is no acknowledgment time to report.
+    // Without the interceptor's counts, written is Connect's write total,
+    // which counts records the broker acknowledged (Connect 3.9 records it in
+    // the producer callback). Subtracting records in flight would count them
+    // twice. There is no acknowledgment time to report.
     @Test
     void withoutTheInterceptorWrittenFallsBackToConnectsCounts() {
-        runningSource(50, 50, 10);
+        runningSource(50, 40, 10);
         Bundle b = collector().collect(NOW).get(0);
         assertEquals(40, b.pipeline().sinkRowsWritten());
+        assertEquals(40, b.pipeline().sinkRowsAccepted());
         assertNull(b.pipeline().lastSinkWriteAt());
         assertNull(b.pipeline().restartCount());
         assertNull(b.pipeline().startedAt());
@@ -171,7 +192,31 @@ class TaskCollectorTest {
         assertEquals("jdbc", b.instance().sinkType());
         assertEquals(1000, b.pipeline().messageCount());
         assertEquals(726, b.pipeline().sinkRowsWritten());
-        assertEquals(12L, b.pipeline().sinkFlushCount());
+        assertNull(b.pipeline().sinkFlushCount());
+    }
+
+    // Connect raises offset-commit-completion-total even when it skips a
+    // commit because nothing changed, as it does every flush interval while
+    // a sink's destination is down. Only rows finishing is a write.
+    @Test
+    void aSinkCommitWithoutNewRowsIsNotAWrite() {
+        jmx.put(SNK_TASK, "status", "running")
+                .put(SNK_METRICS, "sink-record-read-total", 1000.0)
+                .put(SNK_METRICS, "sink-record-send-total", 1000.0)
+                .put(SNK_METRICS, "sink-record-active-count", 1000.0)
+                .put(SNK_METRICS, "offset-commit-completion-total", 12.0);
+        cluster.tasks.put(SNK, new TaskHealth("RUNNING", "10.0.3.8:8083", "sink"));
+        cluster.connectorStates.put("customers-sink", "RUNNING");
+        TaskCollector c = collector();
+        c.collect(NOW);
+        jmx.put(SNK_METRICS, "offset-commit-completion-total", 30.0);
+        Bundle stuck = c.collect(NOW.plusSeconds(60)).get(0);
+        assertNull(stuck.pipeline().lastSinkWriteAt());
+        assertNull(stuck.pipeline().sinkFlushCount());
+
+        jmx.put(SNK_METRICS, "sink-record-active-count", 0.0);
+        Bundle wrote = c.collect(NOW.plusSeconds(120)).get(0);
+        assertEquals(NOW.plusSeconds(120), wrote.pipeline().lastSinkWriteAt());
     }
 
     // A failed task on a live worker is the failure this reporter exists for.
@@ -219,6 +264,127 @@ class TaskCollectorTest {
         jmx.remove(SRC_TASK).remove(SRC_METRICS);
         cluster.connectorStates.put("inventory-cdc", "STOPPED");
         assertEquals("connector_stopped", c.collect(NOW.plusSeconds(60)).get(0).exit().reason());
+    }
+
+    // The status store can say RUNNING, with the task still listed here, for
+    // a tick after the task stopped. The exit waits for a definite answer
+    // rather than being decided once and lost.
+    @Test
+    void anExitWaitsForTheStatusToCatchUp() {
+        runningSource(5, 5, 0);
+        TaskCollector c = collector();
+        c.collect(NOW);
+        jmx.remove(SRC_TASK).remove(SRC_METRICS);
+        assertEquals(List.of(), c.collect(NOW.plusSeconds(60)));
+        cluster.connectorStates.put("inventory-cdc", "STOPPED");
+        cluster.tasks.remove(SRC);
+        assertEquals("connector_stopped", c.collect(NOW.plusSeconds(120)).get(0).exit().reason());
+    }
+
+    // A cluster that cannot answer is not a deleted connector.
+    @Test
+    void anUnreachableClusterIsNotADeletion() {
+        runningSource(5, 5, 0);
+        TaskCollector c = collector();
+        c.collect(NOW);
+        jmx.remove(SRC_TASK).remove(SRC_METRICS);
+        cluster.unreachable.add("inventory-cdc");
+        assertEquals(List.of(), c.collect(NOW.plusSeconds(60)));
+        cluster.unreachable.clear();
+        cluster.connectorStates.remove("inventory-cdc");
+        assertEquals("connector_deleted", c.collect(NOW.plusSeconds(120)).get(0).exit().reason());
+    }
+
+    // Lowering tasks.max removes tasks from a running connector. Each one
+    // ends, and says so, rather than going silent.
+    @Test
+    void aRemovedTaskSendsAnExit() {
+        runningSource(5, 5, 0);
+        TaskCollector c = collector();
+        c.collect(NOW);
+        jmx.remove(SRC_TASK).remove(SRC_METRICS);
+        cluster.tasks.remove(SRC);
+        assertEquals("task_removed", c.collect(NOW.plusSeconds(60)).get(0).exit().reason());
+    }
+
+    // A task now listed on another worker moved: its new worker reports it.
+    @Test
+    void aTaskOnAnotherWorkerSendsNoExit() {
+        runningSource(5, 5, 0);
+        TaskCollector c = collector();
+        c.collect(NOW);
+        jmx.remove(SRC_TASK).remove(SRC_METRICS);
+        cluster.tasks.put(SRC, new TaskHealth("RUNNING", "10.0.3.9:8083", "source"));
+        for (int i = 1; i <= 6; i++) {
+            assertEquals(List.of(), c.collect(NOW.plusSeconds(60L * i)));
+        }
+    }
+
+    // Under exactly-once, Connect builds a consumer for every source task
+    // with the task's consumer client id. It is not a second start.
+    @Test
+    void anExactlyOnceSourceCountsOneStartPerStart() {
+        AckInterceptor ack = new AckInterceptor();
+        ack.configure(Map.of("client.id", "connector-producer-inventory-cdc-0"));
+        new io.turbolytics.turbostats.connect.intercept.ConsumeInterceptor()
+                .configure(Map.of("client.id", "connector-consumer-inventory-cdc-0"));
+        runningSource(5, 5, 0);
+        assertEquals(0L, collector().collect(NOW).get(0).pipeline().restartCount());
+    }
+
+    // During a rebalance the herder refuses config requests. The last good
+    // hash and type stand, rather than a false config change.
+    @Test
+    void anUnavailableConfigKeepsTheLastGoodHashAndType() {
+        runningSource(5, 5, 0);
+        TaskCollector c = collector();
+        Bundle first = c.collect(NOW).get(0);
+        cluster.configUnavailable = true;
+        Bundle second = c.collect(NOW.plusSeconds(60)).get(0);
+        assertEquals(first.instance().configHash(), second.instance().configHash());
+        assertEquals("postgres", second.instance().sourceType());
+    }
+
+    // connector-metrics exists only on the worker running the connector. A
+    // version seen once stands, so it does not flip on every rebalance.
+    @Test
+    void theConnectorVersionIsRemembered() {
+        runningSource(5, 5, 0);
+        jmx.put("kafka.connect:type=connector-metrics,connector=inventory-cdc", "connector-version", "3.0.8.Final");
+        TaskCollector c = collector();
+        assertEquals("3.0.8.Final", c.collect(NOW).get(0).instance().version());
+        jmx.remove("kafka.connect:type=connector-metrics,connector=inventory-cdc");
+        assertEquals("3.0.8.Final", c.collect(NOW.plusSeconds(60)).get(0).instance().version());
+    }
+
+    // Rows discarded under errors.tolerance=all are silent data loss, and
+    // the DLQ's rows are diverted: both are the contract's fields.
+    @Test
+    void droppedAndDivertedRowsAreReported() {
+        runningSource(5, 5, 0);
+        String errors = "kafka.connect:type=task-error-metrics,connector=inventory-cdc,task=0";
+        jmx.put(errors, "total-records-skipped", 7.0)
+                .put(errors, "deadletterqueue-produce-requests", 4.0)
+                .put(errors, "deadletterqueue-produce-failures", 1.0);
+        Bundle b = collector().collect(NOW).get(0);
+        assertEquals(7L, b.pipeline().errorRowsDropped());
+        assertEquals(3L, b.pipeline().dlqRows());
+    }
+
+    // One task that cannot be read must not cost every other task its
+    // report, or the whole worker goes dark.
+    @Test
+    void oneFailingTaskDoesNotDropTheOthers() {
+        runningSource(5, 5, 0);
+        jmx.put(SNK_TASK, "status", "running")
+                .put(SNK_METRICS, "sink-record-read-total", 1.0)
+                .put(SNK_METRICS, "sink-record-send-total", 1.0);
+        cluster.tasks.put(SNK, new TaskHealth("RUNNING", "10.0.3.8:8083", "sink"));
+        cluster.connectorStates.put("customers-sink", "RUNNING");
+        cluster.throwing.add(SNK);
+        List<Bundle> out = collector().collect(NOW);
+        assertEquals(1, out.size());
+        assertEquals("prod-connect/inventory-cdc/0", out.get(0).instance().id());
     }
 
     // Whatever the collector builds must validate, not just hand-made

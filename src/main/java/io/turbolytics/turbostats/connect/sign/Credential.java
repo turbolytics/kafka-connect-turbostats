@@ -24,11 +24,13 @@ public final class Credential {
     private final PrivateKey privateKey;
     private final byte[] publicKey;
     private final String keyId;
+    private final byte[] configHashKey;
 
-    private Credential(PrivateKey privateKey, byte[] publicKey) {
+    private Credential(PrivateKey privateKey, byte[] publicKey, byte[] configHashKey) {
         this.privateKey = privateKey;
         this.publicKey = publicKey;
         this.keyId = keyIdOf(publicKey);
+        this.configHashKey = configHashKey;
     }
 
     /** Messages never contain the input: it is a secret. */
@@ -59,7 +61,7 @@ public final class Credential {
             // An Ed25519 X.509 encoding is a fixed 12-byte prefix and the
             // 32-byte raw key.
             byte[] raw = Arrays.copyOfRange(encoded, encoded.length - 32, encoded.length);
-            return new Credential(kp.getPrivate(), raw);
+            return new Credential(kp.getPrivate(), raw, configHashKeyOf(seed));
         } catch (GeneralSecurityException e) {
             throw new IllegalArgumentException("this JVM cannot make Ed25519 keys: " + e.getClass().getSimpleName());
         }
@@ -71,6 +73,16 @@ public final class Credential {
 
     public byte[] publicKey() {
         return publicKey.clone();
+    }
+
+    /**
+     * The key the config hash is keyed with: derived from the seed, so it is
+     * stable for one install and different across installs, and never the
+     * seed itself. A hash keyed this way cannot be checked against a guessed
+     * password by anyone without the credential.
+     */
+    public byte[] configHashKey() {
+        return configHashKey.clone();
     }
 
     public byte[] sign(byte[] message) {
@@ -88,6 +100,17 @@ public final class Credential {
     public String toString() {
         // A credential logged by accident shows its key id, never its seed.
         return "Credential(" + keyId + ")";
+    }
+
+    private static byte[] configHashKeyOf(byte[] seed) {
+        try {
+            MessageDigest d = MessageDigest.getInstance("SHA-256");
+            d.update("turbostats config hash v1".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            d.update(seed);
+            return d.digest();
+        } catch (GeneralSecurityException e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     /** 16 hex characters of the public key's SHA-256, as the receiver files it. */

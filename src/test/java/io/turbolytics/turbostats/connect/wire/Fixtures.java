@@ -45,7 +45,7 @@ public final class Fixtures {
                 instance("postgres", "kafka", Map.of("region", "eu_west")),
                 process(),
                 new Pipeline("running", T.minusSeconds(600), 0L, 55_000, 55_000, 0, null,
-                        55_000, 55_000, 0, T, T, null),
+                        55_000, 55_000, 0, T, T, null, 0L, 0L),
                 null);
     }
 
@@ -57,7 +57,7 @@ public final class Fixtures {
                 instance("kafka", "jdbc", null),
                 process(),
                 new Pipeline("running", T.minusSeconds(600), 2L, 126_624, 126_624, 0, 410L,
-                        126_624, 126_350, 0, T, T, null),
+                        126_624, 126_350, 0, T, T, null, 0L, 0L),
                 null);
     }
 }

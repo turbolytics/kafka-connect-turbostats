@@ -67,6 +67,14 @@ public class BundleSchemaTest {
         assertEquals("kafka-connect", doc.at("/instance/runtime").asText());
     }
 
+    // The silent-loss fields reach the wire, zero included.
+    @Test
+    void droppedAndDivertedRowsAreSent() throws Exception {
+        JsonNode doc = MAPPER.readTree(Fixtures.sourceBundle().toJson());
+        assertEquals(0, doc.at("/pipeline/error_rows_dropped").asLong(-1));
+        assertEquals(0, doc.at("/pipeline/dlq_rows").asLong(-1));
+    }
+
     // The schema is not vacuous: a pipeline without a required counter fails.
     @Test
     void aBundleMissingARequiredCounterIsRejected() throws Exception {

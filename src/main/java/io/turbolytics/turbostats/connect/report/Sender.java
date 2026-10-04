@@ -46,6 +46,11 @@ public final class Sender {
         Signer.headers(credential, "POST", path, now.getEpochSecond(), body).forEach(req::header);
         // The body is discarded: a v1 reporter acts on no command, and
         // reading it would only hold the connection longer.
-        return client.sendAsync(req.build(), HttpResponse.BodyHandlers.discarding()).thenApply(HttpResponse::statusCode);
+        // The request timeout stops covering the exchange once headers
+        // arrive; a receiver that then stalls the body would hold this post,
+        // and with it every later interval, forever. orTimeout bounds it all.
+        return client.sendAsync(req.build(), HttpResponse.BodyHandlers.discarding())
+                .thenApply(HttpResponse::statusCode)
+                .orTimeout(timeout.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS);
     }
 }

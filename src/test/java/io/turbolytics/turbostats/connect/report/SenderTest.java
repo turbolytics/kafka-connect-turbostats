@@ -20,6 +20,7 @@ import java.util.Base64;
 import java.util.HexFormat;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
@@ -67,6 +68,34 @@ class SenderTest {
             v.update(Signer.canonical("POST", "/v1/turbostats", 1789848000,
                     got.get("body").getBytes(StandardCharsets.UTF_8)).getBytes(StandardCharsets.UTF_8));
             assertTrue(v.verify(Base64.getDecoder().decode(got.get("sig"))));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    // A receiver that sends headers and then stalls the body would hold the
+    // post open forever, and the reporter skips every interval while one is
+    // in flight. The timeout covers the whole exchange.
+    @Test
+    void aStalledBodyTimesOut() throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/turbostats", ex -> {
+            ex.getRequestBody().readAllBytes();
+            ex.sendResponseHeaders(200, 100);
+            try {
+                Thread.sleep(10_000);
+            } catch (InterruptedException ignored) {
+            }
+            ex.close();
+        });
+        server.start();
+        try {
+            URI uri = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/v1/turbostats");
+            long t0 = System.nanoTime();
+            ExecutionException e = org.junit.jupiter.api.Assertions.assertThrows(ExecutionException.class,
+                    () -> new Sender(uri, Credential.parse(KEY), Duration.ofSeconds(1))
+                            .send(Fixtures.sourceBundle(), Instant.now()).get(5, TimeUnit.SECONDS));
+            assertTrue((System.nanoTime() - t0) / 1_000_000 < 4000, "took too long: " + e);
         } finally {
             server.stop(0);
         }

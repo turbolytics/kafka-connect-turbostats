@@ -26,3 +26,5 @@ replay_pid*
 # Maven build output, and this repo's plan workspaces.
 target/
 .superpowers/
+# Plans and specs for this repo live outside it.
+docs/superpowers/

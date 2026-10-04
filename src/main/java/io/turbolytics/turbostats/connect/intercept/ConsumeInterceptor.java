@@ -21,7 +21,7 @@ public final class ConsumeInterceptor implements ConsumerInterceptor<Object, Obj
             Object id = configs == null ? null : configs.get("client.id");
             TaskKey.fromClientId(id == null ? null : String.valueOf(id)).ifPresent(k -> {
                 TaskCounters c = TaskCounters.of(k);
-                c.started(System.currentTimeMillis());
+                c.consumerStarted(System.currentTimeMillis());
                 counters = c;
             });
         } catch (Throwable ignored) {
