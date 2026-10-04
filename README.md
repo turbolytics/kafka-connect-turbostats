@@ -18,7 +18,7 @@ rest.extension.classes=io.turbolytics.turbostats.connect.TurboStatsExtension
 producer.interceptor.classes=io.turbolytics.turbostats.connect.intercept.AckInterceptor
 consumer.interceptor.classes=io.turbolytics.turbostats.connect.intercept.ConsumeInterceptor
 
-turbostats.report.to=https://control.turbolytics.io/v1/turbostats
+turbostats.report.to=https://ingest.turbolytics.io/v1/turbostats
 turbostats.key=${env:TURBOSTATS_KEY}
 config.providers=env
 config.providers.env.class=org.apache.kafka.common.config.provider.EnvVarConfigProvider
