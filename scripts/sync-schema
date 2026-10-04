@@ -1,0 +1,9 @@
+#!/bin/sh
+# Copies the TurboStats bundle schema from turbolytics/sql-flow at a ref, so
+# the tests validate against the contract and not against a copy someone
+# edited. Run it when the contract changes, and commit the result.
+set -eu
+ref="${1:-main}"
+curl -fsSL "https://raw.githubusercontent.com/turbolytics/sql-flow/${ref}/turbostats/wire/schema/bundle.schema.json" \
+  -o src/test/resources/schema/bundle.schema.json
+echo "synced bundle.schema.json from sql-flow@${ref}"
