@@ -27,6 +27,10 @@
 - Prose in comments, README and commit messages follows `turbolytics/sql-flow`'s CLAUDE.md: Google Technical Writing One, SQLFlow and TurboStats named as products. Comments explain why. Commit messages name the defect, the fix and the evidence.
 - CI never caches build artifacts between runs.
 - Every Maven command in this plan runs through `scripts/mvn`, which runs Maven in Docker, outside the sandbox.
+- Three test layers, each its own command and its own CI job:
+  - **Unit:** `*Test` classes, `scripts/mvn test`. Pure logic; no container, no network beyond the loopback.
+  - **Integration:** `*IntegrationIT` classes, `scripts/mvn verify -Pintegration`. The reporter's classes against real dependencies: Kafka clients and a real broker, Kafka's own JMX reporter.
+  - **Release:** `*ReleaseIT` classes, `scripts/mvn verify -Prelease`. The built jar installed in the Debezium image, reporting to a fake control plane that records every post to `target/release/posts.jsonl`.
 
 ## Review Focus
 
@@ -4051,15 +4055,352 @@ new worker."
 
 ---
 
-### Task 13: Against a real worker
+### Task 13: Integration tests
 
 **Files:**
-- Create: `src/test/java/io/turbolytics/turbostats/connect/WorkerIT.java`
+- Modify: `pom.xml` (a test dependency, failsafe includes, two profiles)
+- Modify: `.github/workflows/ci.yml` (three jobs)
+- Create: `src/test/java/io/turbolytics/turbostats/connect/intercept/InterceptorIntegrationIT.java`
+- Create: `src/test/java/io/turbolytics/turbostats/connect/collect/ConnectMetricsIntegrationIT.java`
 
 **Interfaces:**
-- Consumes: the built jar `target/kafka-connect-turbostats-0.1.0-SNAPSHOT.jar` (the failsafe plugin runs after `package`), `Credential` and `Signer` (Task 4), the vendored schema (Task 3).
+- Consumes: `AckInterceptor`, `ConsumeInterceptor`, `TaskCounters` (Task 7); `ConnectMetrics`, `PlatformJmx` (Task 9); `TaskKey` (Task 6).
+- Produces: the Maven profiles `integration` and `release`, which Task 14 uses.
 
-- [ ] **Step 1: Write the integration test**
+- [ ] **Step 1: Split the layers in the build**
+
+In `pom.xml`, add to `<properties>`:
+
+```xml
+    <!-- Integration and release tests run only in their profiles, so
+         `mvn verify` alone is the unit layer and packaging. -->
+    <skipITs>true</skipITs>
+    <it.includes>none</it.includes>
+```
+
+Add the Kafka module to the test dependencies:
+
+```xml
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>kafka</artifactId>
+      <version>1.20.6</version>
+      <scope>test</scope>
+    </dependency>
+```
+
+Give the failsafe plugin a configuration:
+
+```xml
+        <configuration>
+          <includes>
+            <include>${it.includes}</include>
+          </includes>
+        </configuration>
+```
+
+and add, after `</build>`:
+
+```xml
+  <profiles>
+    <profile>
+      <id>integration</id>
+      <properties>
+        <skipITs>false</skipITs>
+        <it.includes>**/*IntegrationIT.java</it.includes>
+      </properties>
+    </profile>
+    <profile>
+      <id>release</id>
+      <properties>
+        <skipITs>false</skipITs>
+        <it.includes>**/*ReleaseIT.java</it.includes>
+      </properties>
+    </profile>
+  </profiles>
+```
+
+Replace `.github/workflows/ci.yml` with:
+
+```yaml
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No cache: every run resolves its dependencies fresh.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - run: mvn -B test
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - run: mvn -B verify -Pintegration
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - run: mvn -B verify -Prelease
+      # What the fake control plane received, for anyone reading a failure.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-posts
+          path: target/release/posts.jsonl
+          if-no-files-found: ignore
+```
+
+Run: `scripts/mvn -q verify && scripts/mvn verify -Pintegration 2>&1 | grep -E 'Tests run|No tests'`
+Expected: the plain `verify` runs no integration test; the profile reports `No tests to run`, because none exist yet.
+
+- [ ] **Step 2: Write the interceptor integration test**
+
+`InterceptorIntegrationIT.java`:
+
+```java
+package io.turbolytics.turbostats.connect.intercept;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import io.turbolytics.turbostats.connect.collect.TaskKey;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.Properties;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.serialization.StringSerializer;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.testcontainers.kafka.KafkaContainer;
+
+/**
+ * The interceptors inside real Kafka clients against a real broker. A unit
+ * test calls onAcknowledgement by hand; only a broker proves the client
+ * calls it once per acknowledged record, and calls configure once per
+ * client.
+ */
+class InterceptorIntegrationIT {
+    static KafkaContainer kafka;
+
+    @BeforeAll
+    static void start() {
+        kafka = new KafkaContainer("apache/kafka:3.8.0");
+        kafka.start();
+    }
+
+    @AfterAll
+    static void stop() {
+        if (kafka != null) {
+            kafka.stop();
+        }
+    }
+
+    @BeforeEach
+    void reset() {
+        TaskCounters.clear();
+    }
+
+    static KafkaProducer<String, String> producer(String clientId) {
+        Properties p = new Properties();
+        p.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers());
+        p.put(ProducerConfig.CLIENT_ID_CONFIG, clientId);
+        p.put(ProducerConfig.INTERCEPTOR_CLASSES_CONFIG, AckInterceptor.class.getName());
+        p.put(ProducerConfig.ACKS_CONFIG, "all");
+        return new KafkaProducer<>(p, new StringSerializer(), new StringSerializer());
+    }
+
+    // Every record the broker acknowledged, and no more.
+    @Test
+    void countsWhatTheBrokerAcknowledged() {
+        try (KafkaProducer<String, String> p = producer("connector-producer-it-cdc-0")) {
+            for (int i = 0; i < 500; i++) {
+                p.send(new ProducerRecord<>("it-acks", "k" + i, "v" + i));
+            }
+            p.flush();
+        }
+        TaskCounters.Snapshot s = TaskCounters.find(new TaskKey("it-cdc", 0)).orElseThrow().snapshot();
+        assertEquals(1, s.starts());
+        assertEquals(500, s.acked());
+        assertTrue(s.lastAckMillis() > 0);
+    }
+
+    // A second producer for the same task is a restart: one more start, and
+    // the acknowledged count begins again with the new epoch.
+    @Test
+    void aNewProducerIsOneStart() {
+        try (KafkaProducer<String, String> p = producer("connector-producer-it-restart-0")) {
+            p.send(new ProducerRecord<>("it-acks", "k", "v"));
+            p.flush();
+        }
+        try (KafkaProducer<String, String> p = producer("connector-producer-it-restart-0")) {
+            p.flush();
+        }
+        TaskCounters.Snapshot s = TaskCounters.find(new TaskKey("it-restart", 0)).orElseThrow().snapshot();
+        assertEquals(2, s.starts());
+        assertEquals(0, s.acked());
+    }
+
+    @Test
+    void aConsumerNotesItsBatches() {
+        try (KafkaProducer<String, String> p = producer("not-a-task")) {
+            p.send(new ProducerRecord<>("it-consume", "k", "v"));
+            p.flush();
+        }
+        Properties c = new Properties();
+        c.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers());
+        c.put(ConsumerConfig.CLIENT_ID_CONFIG, "connector-consumer-it-sink-0");
+        c.put(ConsumerConfig.GROUP_ID_CONFIG, "connect-it-sink");
+        c.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        c.put(ConsumerConfig.INTERCEPTOR_CLASSES_CONFIG, ConsumeInterceptor.class.getName());
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(c, new StringDeserializer(), new StringDeserializer())) {
+            consumer.subscribe(List.of("it-consume"));
+            Instant deadline = Instant.now().plusSeconds(30);
+            while (Instant.now().isBefore(deadline) && consumer.poll(Duration.ofMillis(500)).isEmpty()) {
+                // Polls until the group joins and the record arrives.
+            }
+        }
+        TaskCounters.Snapshot s = TaskCounters.find(new TaskKey("it-sink", 0)).orElseThrow().snapshot();
+        assertEquals(1, s.starts());
+        assertTrue(s.lastBatchMillis() > 0);
+    }
+}
+```
+
+- [ ] **Step 3: Write the JMX integration test**
+
+`ConnectMetricsIntegrationIT.java`:
+
+```java
+package io.turbolytics.turbostats.connect.collect;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.util.List;
+import java.util.Map;
+import java.util.OptionalLong;
+import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.metrics.Gauge;
+import org.apache.kafka.common.metrics.JmxReporter;
+import org.apache.kafka.common.metrics.KafkaMetricsContext;
+import org.apache.kafka.common.metrics.MetricConfig;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.stats.CumulativeSum;
+import org.apache.kafka.common.utils.Time;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+/**
+ * ConnectMetrics against Kafka's own JmxReporter, the reporter Connect
+ * registers its metrics through. The fake in the unit tests was written by
+ * hand; this proves the real MBean names, quoting and value types read the
+ * same way.
+ */
+class ConnectMetricsIntegrationIT {
+    Metrics metrics;
+
+    @BeforeEach
+    void start() {
+        metrics = new Metrics(new MetricConfig(), List.of(new JmxReporter()), Time.SYSTEM,
+                new KafkaMetricsContext("kafka.connect"));
+    }
+
+    @AfterEach
+    void stop() {
+        metrics.close();
+    }
+
+    void task(String connector, int task, double polled) {
+        Map<String, String> tags = Map.of("connector", connector, "task", Integer.toString(task));
+        metrics.addMetric(metrics.metricName("status", "connector-task-metrics", "", tags),
+                (Gauge<String>) (config, now) -> "running");
+        MetricName poll = metrics.metricName("source-record-poll-total", "source-task-metrics", "", tags);
+        Sensor s = metrics.sensor(connector + "-" + task + "-poll");
+        s.add(poll, new CumulativeSum());
+        s.record(polled);
+    }
+
+    @Test
+    void readsTasksAndTotalsAsConnectRegistersThem() {
+        task("orders-cdc-v2", 0, 42);
+        ConnectMetrics m = new ConnectMetrics(new PlatformJmx());
+        TaskKey k = new TaskKey("orders-cdc-v2", 0);
+        assertTrue(m.localTasks().contains(k));
+        assertEquals(OptionalLong.of(42), m.total("source-task-metrics", k, "source-record-poll-total"));
+    }
+
+    // Kafka's reporter quotes a tag value that holds a JMX-special
+    // character. The reporter must find the task under its real name.
+    @Test
+    void aConnectorNameKafkaQuotesIsFound() {
+        task("a:b", 1, 7);
+        ConnectMetrics m = new ConnectMetrics(new PlatformJmx());
+        TaskKey k = new TaskKey("a:b", 1);
+        assertTrue(m.localTasks().contains(k), m.localTasks().toString());
+        assertEquals(OptionalLong.of(7), m.total("source-task-metrics", k, "source-record-poll-total"));
+    }
+}
+```
+
+- [ ] **Step 4: Run the integration layer**
+
+Run: `scripts/mvn verify -Pintegration`
+Expected: unit tests PASS, then `InterceptorIntegrationIT` (3 tests) and `ConnectMetricsIntegrationIT` (2 tests) PASS. If Testcontainers cannot reach Docker from inside the Maven container, run the same command with a local JDK 17 and Maven: `mvn verify -Pintegration`.
+
+If `aConnectorNameKafkaQuotesIsFound` fails, Kafka sanitizes the name rather than quoting it. Read the MBean name it registered from the failure message, and make `ConnectMetrics.unquote` match what Kafka writes.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add pom.xml .github/workflows/ci.yml src/test/java
+git commit -m "test: three layers, and the integration layer against real Kafka
+
+Unit tests call the interceptors by hand and read a hand-written JMX fake.
+The integration layer runs the interceptors inside real Kafka clients
+against a real broker, which proves the client calls them once per
+acknowledged record and once per configure, and reads ConnectMetrics
+through Kafka's own JmxReporter, which proves the real MBean names and
+quoting. Unit, integration and release run as separate profiles and CI
+jobs."
+```
+
+---
+
+### Task 14: The release test
+
+**Files:**
+- Create: `src/test/java/io/turbolytics/turbostats/connect/WorkerReleaseIT.java`
+
+**Interfaces:**
+- Consumes: the built jar `target/kafka-connect-turbostats-0.1.0-SNAPSHOT.jar` (the failsafe plugin runs after `package`), `Credential` and `Signer` (Task 4), the vendored schema (Task 3), the `release` profile (Task 13).
+
+- [ ] **Step 1: Write the release test**
 
 ```java
 package io.turbolytics.turbostats.connect;
@@ -4080,6 +4421,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.KeyFactory;
 import java.security.Signature;
@@ -4100,11 +4442,13 @@ import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.utility.MountableFile;
 
 /**
- * Drives the built jar inside a real Kafka Connect worker. A unit test
- * cannot prove the jar loads on the worker classpath, that Connect calls the
- * interceptors, or that a worker's real metrics map onto the contract.
+ * The release test: the built jar, installed in the Debezium image as an
+ * operator would install it, reporting to a fake control plane that records
+ * every post. Neither a unit nor an integration test can prove the jar loads
+ * on the worker classpath, that Connect calls the interceptors, or that a
+ * worker's real metrics map onto the contract.
  */
-class WorkerIT {
+class WorkerReleaseIT {
     static final ObjectMapper MAPPER = new ObjectMapper();
     static final String KEY = "sfc_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
     static final Path JAR = Path.of("target/kafka-connect-turbostats-0.1.0-SNAPSHOT.jar");
@@ -4197,6 +4541,17 @@ class WorkerIT {
 
     @AfterAll
     static void stop() {
+        // Recorded before anything stops, so a failure leaves the evidence:
+        // every post the fake control plane received, one JSON line each.
+        if (receiver != null) {
+            try {
+                Path out = Path.of("target/release/posts.jsonl");
+                Files.createDirectories(out.getParent());
+                Files.writeString(out, receiver.getLogs());
+            } catch (Exception e) {
+                System.err.println("could not record the posts: " + e);
+            }
+        }
         for (GenericContainer<?> c : new GenericContainer<?>[] {receiver, connect, postgres, kafka}) {
             if (c != null) {
                 c.stop();
@@ -4331,27 +4686,28 @@ class WorkerIT {
 
 - [ ] **Step 2: Run it**
 
-Run: `scripts/mvn verify`
-Expected: unit tests PASS, then `WorkerIT` PASS, 4 tests, in under ten minutes. If Testcontainers cannot reach Docker from inside the Maven container, run the same command with a local JDK 17 and Maven instead: `brew install openjdk@17 maven && mvn verify`.
+Run: `scripts/mvn verify -Prelease`
+Expected: unit tests PASS, then `WorkerReleaseIT` PASS, 4 tests, in under ten minutes, and `target/release/posts.jsonl` holds one JSON line per post. If Testcontainers cannot reach Docker from inside the Maven container, run the same command with a local JDK 17 and Maven instead: `brew install openjdk@17 maven && mvn verify -Prelease`.
 
 If `aRestartCountsOnce` reports 2, Connect configured the producer twice for one start, as the spike saw once. Do not change the test: record the observed sequence of `configure` calls in the ledger and stop for a decision, because the restart signal is then unreliable.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add src/test/java/io/turbolytics/turbostats/connect/WorkerIT.java
-git commit -m "test: the built jar inside a real Kafka Connect worker
+git add src/test/java/io/turbolytics/turbostats/connect/WorkerReleaseIT.java
+git commit -m "test: the release layer installs the built jar in Debezium
 
-A unit test cannot prove the jar loads on the worker classpath, that
+Neither a unit nor an integration test can prove the jar loads on the worker classpath, that
 Connect calls the interceptors, or that real metrics map onto the
 contract. Against Debezium on Kafka Connect 3.9: a running connector posts
 signed bundles that validate and verify; a bad password reports failed;
-one REST restart counts one; a deleted connector sends an exit."
+one REST restart counts one; a deleted connector sends an exit. Every post
+the fake control plane received is recorded to target/release/posts.jsonl."
 ```
 
 ---
 
-### Task 14: The README and a release
+### Task 15: The README and a release
 
 **Files:**
 - Modify: `README.md`
@@ -4409,6 +4765,16 @@ One report per task, under the id `<cluster>/<connector>/<task>`:
 - The connector's type and a hash of its config. The config itself never leaves the worker: it holds your database password.
 
 When a connector is deleted or stopped, each of its tasks sends a final report saying so. A task that moves to another worker continues under the same id.
+
+## Testing
+
+Three layers, each its own command and CI job. Maven runs in Docker through `scripts/mvn`, so no local JDK is needed.
+
+| Layer | Command | What it proves |
+|---|---|---|
+| Unit | `scripts/mvn test` | The reporter's logic, with no container. |
+| Integration | `scripts/mvn verify -Pintegration` | The interceptors inside real Kafka clients against a real broker, and the metric reader against Kafka's own JMX reporter. |
+| Release | `scripts/mvn verify -Prelease` | The built jar installed in the Debezium image, reporting to a fake control plane. Every post it received is in `target/release/posts.jsonl`. |
 ````
 
 - [ ] **Step 2: Write the release workflow**
@@ -4439,8 +4805,8 @@ jobs:
 
 - [ ] **Step 3: Check the README's properties against the integration test**
 
-Run: `grep -c 'io.turbolytics.turbostats.connect' README.md src/test/java/io/turbolytics/turbostats/connect/WorkerIT.java`
-Expected: both files name the same three classes; the README's class names match `WorkerIT`'s `CONNECT_*_CLASSES` values exactly.
+Run: `grep -c 'io.turbolytics.turbostats.connect' README.md src/test/java/io/turbolytics/turbostats/connect/WorkerReleaseIT.java`
+Expected: both files name the same three classes; the README's class names match `WorkerReleaseIT`'s `CONNECT_*_CLASSES` values exactly.
 
 - [ ] **Step 4: Commit**
 
