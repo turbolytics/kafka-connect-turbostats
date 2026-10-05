@@ -8,9 +8,12 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.ApiException;
 
 /**
  * Each sink task's lag in messages, from the broker. The consumer's own
@@ -21,11 +24,19 @@ import org.apache.kafka.common.TopicPartition;
 public final class BrokerLag {
     private final Supplier<GroupAdmin> factory;
     private final Duration timeout;
+    private final Consumer<String> warn;
+    private final Set<String> warned = new HashSet<>();
     private GroupAdmin admin;
 
     public BrokerLag(Supplier<GroupAdmin> factory, Duration timeout) {
+        this(factory, timeout, w -> {
+        });
+    }
+
+    public BrokerLag(Supplier<GroupAdmin> factory, Duration timeout, Consumer<String> warn) {
         this.factory = factory;
         this.timeout = timeout;
+        this.warn = warn;
     }
 
     /** Keyed by task; a connector the broker could not answer for is absent this tick. */
@@ -37,15 +48,37 @@ public final class BrokerLag {
                     admin = factory.get();
                 }
                 out.putAll(lags(e.getKey(), e.getValue(), now));
-            } catch (TimeoutException ex) {
-                // A slow broker is slow for every connector: asking about the
-                // rest would hold the tick for a timeout each. It is asked
-                // again next tick, on the same client.
-                break;
             } catch (Exception ex) {
-                // Possibly a broken client, so the next tick builds a fresh one.
+                Throwable cause = ex instanceof ExecutionException && ex.getCause() != null ? ex.getCause() : ex;
+                if (cause instanceof TimeoutException
+                        || cause instanceof org.apache.kafka.common.errors.TimeoutException) {
+                    // A slow broker is slow for every connector: asking about
+                    // the rest would hold the tick for a timeout each. It is
+                    // asked again next tick, on the same client.
+                    break;
+                }
+                if (cause instanceof InterruptedException) {
+                    // The worker is shutting down.
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                if (cause instanceof ApiException) {
+                    // The broker answered: a denied group or a deleted topic
+                    // stays so next tick, and the client works.
+                    if (warned.add(e.getKey())) {
+                        warn.accept("turbostats: the broker refused sink lag for " + e.getKey() + " (group "
+                                + e.getValue() + "): " + cause.getClass().getSimpleName()
+                                + ". Allow DESCRIBE on the group, or set turbostats admin.* settings");
+                    }
+                    continue;
+                }
+                // Possibly a broken client. The next tick builds a fresh one;
+                // building one per connector would cost every report a
+                // connect and a close each.
                 close();
+                break;
             }
+            warned.remove(e.getKey());
         }
         return out;
     }

@@ -73,7 +73,7 @@ public final class TurboStatsExtension implements ConnectRestExtension {
             // connectors never opens a connection for it.
             Map<String, ?> settings = worker;
             brokerLag = new BrokerLag(() -> new KafkaGroupAdmin(AdminSettings.from(settings)),
-                    Duration.ofSeconds(cfg.timeoutSeconds()));
+                    Duration.ofSeconds(cfg.timeoutSeconds()), LOG::warn);
             TaskCollector collector = new TaskCollector(
                     cfg,
                     new PlatformJmx(),

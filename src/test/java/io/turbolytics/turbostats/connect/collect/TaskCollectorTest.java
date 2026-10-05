@@ -131,6 +131,7 @@ class TaskCollectorTest {
     @Test
     void aDebeziumSourceReportsBackfillLagAndConnection() {
         runningSource(10, 10, 0);
+        new AckInterceptor().configure(Map.of("client.id", "connector-producer-inventory-cdc-0"));
         jmx.put(DBZ_SNAP, "SnapshotCompleted", true).put(DBZ_SNAP, "TotalTableCount", 1)
                 .put(DBZ_SNAP, "RemainingTableCount", 0)
                 .put(DBZ_STREAM, "Connected", true).put(DBZ_STREAM, "MilliSecondsBehindSource", 250L)
@@ -154,6 +155,37 @@ class TaskCollectorTest {
         assertNull(b.pipeline().eventLag());
         assertNull(b.pipeline().sourceConnected());
         assertNull(b.pipeline().sinkWireBytes());
+    }
+
+    // Review: Debezium registers one set of metrics per topic.prefix, so two
+    // connectors sharing one would each read the other's.
+    @Test
+    void twoConnectorsWithOnePrefixSayUnknown() {
+        runningSource(10, 10, 0);
+        TaskKey other = new TaskKey("inventory-cdc-2", 0);
+        jmx.put("kafka.connect:type=connector-task-metrics,connector=inventory-cdc-2,task=0", "status", "running")
+                .put("kafka.connect:type=source-task-metrics,connector=inventory-cdc-2,task=0",
+                        "source-record-poll-total", 10.0)
+                .put("kafka.connect:type=source-task-metrics,connector=inventory-cdc-2,task=0",
+                        "source-record-write-total", 10.0)
+                .put("kafka.connect:type=source-task-metrics,connector=inventory-cdc-2,task=0",
+                        "source-record-active-count", 0.0);
+        cluster.tasks.put(other, new TaskHealth("RUNNING", "10.0.3.7:8083", "source"));
+        cluster.connectorStates.put("inventory-cdc-2", "RUNNING");
+        new AckInterceptor().configure(Map.of("client.id", "connector-producer-inventory-cdc-0"));
+        new AckInterceptor().configure(Map.of("client.id", "connector-producer-inventory-cdc-2-0"));
+        jmx.put(DBZ_SNAP, "SnapshotCompleted", true).put(DBZ_STREAM, "Connected", true)
+                .put(DBZ_STREAM, "MilliSecondsBehindSource", 250L);
+        TaskCollector c = collector();
+        List<Bundle> out = c.collect(NOW);
+        c.collect(NOW);
+        assertEquals(2, out.size());
+        for (Bundle b : out) {
+            assertEquals("unknown", b.pipeline().backfill().state());
+            assertNull(b.pipeline().eventLag());
+            assertNull(b.pipeline().sourceConnected());
+        }
+        assertEquals(2, warnings.stream().filter(w -> w.contains("topic.prefix")).count());
     }
 
     // Review focus: a worker with no tasks sends nothing.

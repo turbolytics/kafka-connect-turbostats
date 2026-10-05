@@ -27,6 +27,7 @@ public final class DebeziumMetrics {
 
     public record View(List<Map<String, Object>> snapshot, boolean snapshotStale,
             List<Map<String, Object>> streaming, boolean streamingStale) {
+        public static final View UNKNOWN = new View(List.of(), true, List.of(), true);
     }
 
     private final Jmx jmx;
@@ -35,6 +36,10 @@ public final class DebeziumMetrics {
         this.jmx = jmx;
     }
 
+    /**
+     * Without the task's start (taskStartMillis 0) every metric is stale:
+     * nothing tells this run's from the run before it.
+     */
     public View read(String topicPrefix, TaskKey k, long taskStartMillis) {
         List<Map<String, Object>> snapshot = new ArrayList<>();
         List<Map<String, Object>> streaming = new ArrayList<>();
@@ -48,7 +53,7 @@ public final class DebeziumMetrics {
             if (task == null ? k.task() != 0 : !task.equals(Integer.toString(k.task()))) {
                 continue;
             }
-            boolean stale = taskStartMillis > 0 && jmx.registeredAt(n) < taskStartMillis;
+            boolean stale = taskStartMillis <= 0 || jmx.registeredAt(n) < taskStartMillis;
             Map<String, Object> values = new HashMap<>();
             for (String a : ATTRIBUTES) {
                 Object v = jmx.attribute(n, a);
@@ -111,7 +116,7 @@ public final class DebeziumMetrics {
 
     /**
      * Absent while a blocking snapshot runs, because the stream has not
-     * opened, and when the metrics are missing or stale.
+     * opened, and when the metrics are missing, stale or unreadable.
      */
     public static Boolean sourceConnected(View v, Backfill b) {
         if (v.streaming().isEmpty() || v.streamingStale()) {
@@ -120,7 +125,16 @@ public final class DebeziumMetrics {
         if (b != null && b.blocksStream()) {
             return null;
         }
-        return v.streaming().stream().allMatch(m -> Boolean.TRUE.equals(m.get("Connected")));
+        boolean connected = true;
+        for (Map<String, Object> m : v.streaming()) {
+            // An unreadable attribute measured nothing; false would say the
+            // source is lost.
+            if (!(m.get("Connected") instanceof Boolean c)) {
+                return null;
+            }
+            connected &= c;
+        }
+        return connected;
     }
 
     /** Now less the fewest milliseconds since any current context's last event. */

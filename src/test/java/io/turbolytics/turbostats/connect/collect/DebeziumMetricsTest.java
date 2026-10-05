@@ -15,7 +15,7 @@ class DebeziumMetricsTest {
     @Test
     void readsBothContextsByPrefix() {
         FakeJmx jmx = new FakeJmx().put(SNAP, "SnapshotCompleted", true).put(STREAM, "Connected", true);
-        DebeziumMetrics.View v = new DebeziumMetrics(jmx).read("inv", K, 0);
+        DebeziumMetrics.View v = new DebeziumMetrics(jmx).read("inv", K, 1);
         assertEquals(1, v.snapshot().size());
         assertEquals(1, v.streaming().size());
         assertFalse(v.snapshotStale());
@@ -26,7 +26,7 @@ class DebeziumMetricsTest {
     void onlyThisPrefixCounts() {
         FakeJmx jmx = new FakeJmx().put(SNAP, "SnapshotCompleted", true)
                 .put("debezium.postgres:type=connector-metrics,context=streaming,server=inv2", "Connected", true);
-        DebeziumMetrics.View v = new DebeziumMetrics(jmx).read("inv", K, 0);
+        DebeziumMetrics.View v = new DebeziumMetrics(jmx).read("inv", K, 1);
         assertEquals(0, v.streaming().size());
     }
 
@@ -37,7 +37,7 @@ class DebeziumMetricsTest {
                 .put("debezium.sql_server:type=connector-metrics,context=streaming,server=inv,task=0,database=a", "Connected", true)
                 .put("debezium.sql_server:type=connector-metrics,context=streaming,server=inv,task=0,database=b", "Connected", true)
                 .put("debezium.sql_server:type=connector-metrics,context=streaming,server=inv,task=1,database=c", "Connected", true);
-        assertEquals(2, new DebeziumMetrics(jmx).read("inv", K, 0).streaming().size());
+        assertEquals(2, new DebeziumMetrics(jmx).read("inv", K, 1).streaming().size());
     }
 
     // Registered before the task's last start: the run before it.
@@ -46,5 +46,15 @@ class DebeziumMetricsTest {
         FakeJmx jmx = new FakeJmx().put(SNAP, "SnapshotRunning", true).registeredAt(SNAP, 1_000);
         assertTrue(new DebeziumMetrics(jmx).read("inv", K, 2_000).snapshotStale());
         assertFalse(new DebeziumMetrics(jmx).read("inv", K, 500).snapshotStale());
+    }
+
+    // Review: without the task's start nothing tells this run's metrics
+    // from the last run's, so none count as current.
+    @Test
+    void anUnknownStartMakesEveryMetricStale() {
+        FakeJmx jmx = new FakeJmx().put(SNAP, "SnapshotRunning", true).put(STREAM, "Connected", true);
+        DebeziumMetrics.View v = new DebeziumMetrics(jmx).read("inv", K, 0);
+        assertTrue(v.snapshotStale());
+        assertTrue(v.streamingStale());
     }
 }

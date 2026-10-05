@@ -83,6 +83,12 @@ class DebeziumMapTest {
                 Backfill.none()));
     }
 
+    // Review: an unreadable Connected is no reading, not a disconnect.
+    @Test
+    void anUnreadableConnectionIsAbsent() {
+        assertNull(DebeziumMetrics.sourceConnected(view(List.of(), false, List.of(Map.of()), false), Backfill.none()));
+    }
+
     // Per-database MBeans are shards: lag is the worst.
     @Test
     void databasesCollapseAsShards() {

@@ -6,11 +6,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.turbolytics.turbostats.connect.wire.MessageLag;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.GroupAuthorizationException;
 import org.junit.jupiter.api.Test;
 
 class BrokerLagTest {
@@ -23,12 +28,16 @@ class BrokerLagTest {
         Map<String, Set<TopicPartition>> members = new HashMap<>();
         Map<TopicPartition, Long> committed = new HashMap<>();
         Map<TopicPartition, Long> ends = new HashMap<>();
+        Map<String, Exception> fail = new HashMap<>();
         boolean timeout;
         int closed;
 
         public Map<String, Set<TopicPartition>> assignments(String group, Duration t) throws Exception {
             if (timeout) {
                 throw new TimeoutException("broker");
+            }
+            if (fail.containsKey(group)) {
+                throw fail.get(group);
             }
             return members;
         }
@@ -116,5 +125,78 @@ class BrokerLagTest {
         };
         new BrokerLag(() -> counting, Duration.ofSeconds(1)).lags(Map.of("a", "connect-a", "b", "connect-b"), NOW);
         assertEquals(1, asked[0]);
+    }
+
+    // Review: a denied group is denied on every tick. Rebuilding the client
+    // for it would cost each tick a connect and a close, so the client stays,
+    // the other connectors still get lag, and the denial is said once.
+    @Test
+    void aDeniedGroupKeepsTheClientAndWarnsOnce() {
+        Fake f = new Fake();
+        f.fail.put("connect-a", new ExecutionException(new GroupAuthorizationException("denied")));
+        f.members.put("connector-consumer-b-0", Set.of(P0));
+        f.committed.put(P0, 1L);
+        f.ends.put(P0, 4L);
+        int[] built = {0};
+        List<String> warnings = new ArrayList<>();
+        BrokerLag lag = new BrokerLag(() -> {
+            built[0]++;
+            return f;
+        }, Duration.ofSeconds(1), warnings::add);
+        Map<String, String> groups = new TreeMap<>(Map.of("a", "connect-a", "b", "connect-b"));
+        lag.lags(groups, NOW);
+        Map<TaskKey, MessageLag> second = lag.lags(groups, NOW);
+        assertEquals(new MessageLag(3, 3, 1, NOW), second.get(new TaskKey("b", 0)));
+        assertEquals(1, built[0]);
+        assertEquals(0, f.closed);
+        assertEquals(1, warnings.size());
+    }
+
+    // Review: the admin client's own timeout arrives wrapped, and is as slow
+    // for the next connector as for this one.
+    @Test
+    void kafkasTimeoutEndsTheTick() {
+        Fake f = new Fake();
+        f.fail.put("connect-a", new ExecutionException(new org.apache.kafka.common.errors.TimeoutException("slow")));
+        f.fail.put("connect-b", new ExecutionException(new org.apache.kafka.common.errors.TimeoutException("slow")));
+        int[] built = {0};
+        new BrokerLag(() -> {
+            built[0]++;
+            return f;
+        }, Duration.ofSeconds(1)).lags(Map.of("a", "connect-a", "b", "connect-b"), NOW);
+        assertEquals(0, f.closed);
+        assertEquals(1, built[0]);
+    }
+
+    // Review: a broken client is rebuilt on the next tick, not once per
+    // connector on this one.
+    @Test
+    void aBrokenClientIsRebuiltOncePerTick() {
+        Fake f = new Fake();
+        f.fail.put("connect-a", new IllegalStateException("broken"));
+        f.fail.put("connect-b", new IllegalStateException("broken"));
+        int[] built = {0};
+        new BrokerLag(() -> {
+            built[0]++;
+            return f;
+        }, Duration.ofSeconds(1)).lags(Map.of("a", "connect-a", "b", "connect-b"), NOW);
+        assertEquals(1, built[0]);
+        assertEquals(1, f.closed);
+    }
+
+    // Review: shutdown interrupts the reporter. The interrupt is kept, and
+    // no client is built after it.
+    @Test
+    void anInterruptEndsTheTickAndIsKept() {
+        Fake f = new Fake();
+        f.fail.put("connect-a", new InterruptedException());
+        f.fail.put("connect-b", new InterruptedException());
+        int[] built = {0};
+        new BrokerLag(() -> {
+            built[0]++;
+            return f;
+        }, Duration.ofSeconds(1)).lags(Map.of("a", "connect-a", "b", "connect-b"), NOW);
+        assertTrue(Thread.interrupted());
+        assertEquals(1, built[0]);
     }
 }

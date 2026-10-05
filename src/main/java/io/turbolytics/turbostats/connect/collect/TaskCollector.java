@@ -57,6 +57,8 @@ public final class TaskCollector {
     private final Map<String, String> versions = new HashMap<>();
     private final Set<TaskKey> warnedBrokenAcks = new HashSet<>();
     private final Set<TaskKey> warnedUnreadable = new HashSet<>();
+    private final Set<String> warnedSharedPrefix = new HashSet<>();
+    private Set<String> sharedPrefixes = Set.of();
     private long tick;
 
     private record Seen(long input, Instant inputChangedAt, long written, Instant writtenChangedAt,
@@ -92,6 +94,7 @@ public final class TaskCollector {
         Set<TaskKey> local = new HashSet<>(metrics.localTasks());
         ProcessInfo jvm = local.isEmpty() ? null : process.get();
         lags = sinkLags(local, now);
+        sharedPrefixes = sharedPrefixes(local);
         for (TaskKey k : local) {
             pending.remove(k);
             try {
@@ -260,8 +263,19 @@ public final class TaskCollector {
         Boolean sourceConnected = null;
         if (!sink && f != null && f.debezium()) {
             // Metrics registered before this task's start are the last
-            // run's; without a known start none can be judged stale.
-            DebeziumMetrics.View view = debezium.read(f.topicPrefix(), k, starts > 0 ? startMillis : 0);
+            // run's. Without a known start, which the interceptors record,
+            // none count as current.
+            DebeziumMetrics.View view;
+            if (sharedPrefixes.contains(f.topicPrefix())) {
+                if (warnedSharedPrefix.add(k.connector())) {
+                    warn.accept("turbostats: " + k.connector() + " shares topic.prefix " + f.topicPrefix()
+                            + " with another connector on this worker. Debezium's metrics cannot tell them apart, "
+                            + "so its snapshot, event lag and connection are unknown");
+                }
+                view = DebeziumMetrics.View.UNKNOWN;
+            } else {
+                view = debezium.read(f.topicPrefix(), k, starts > 0 ? startMillis : 0);
+            }
             backfill = DebeziumMetrics.backfill(view);
             eventLag = DebeziumMetrics.eventLag(view, now);
             sourceConnected = DebeziumMetrics.sourceConnected(view, backfill);
@@ -367,6 +381,34 @@ public final class TaskCollector {
             }
         }
         return groups.isEmpty() ? Map.of() : brokerLag.lags(groups, now);
+    }
+
+    /**
+     * Debezium registers one set of metrics per topic.prefix, and refuses a
+     * second connector's under the same name, so local connectors sharing a
+     * prefix would read each other's.
+     */
+    private Set<String> sharedPrefixes(Set<TaskKey> local) {
+        Map<String, Set<String>> byPrefix = new HashMap<>();
+        Set<String> connectors = new HashSet<>();
+        local.forEach(k -> connectors.add(k.connector()));
+        for (String c : connectors) {
+            try {
+                ConnectorFacts f = facts(c);
+                if (f != null && f.debezium()) {
+                    byPrefix.computeIfAbsent(f.topicPrefix(), x -> new HashSet<>()).add(c);
+                }
+            } catch (RuntimeException ignored) {
+                // The connector's own bundle reports what it can.
+            }
+        }
+        Set<String> out = new HashSet<>();
+        byPrefix.forEach((p, cs) -> {
+            if (cs.size() > 1) {
+                out.add(p);
+            }
+        });
+        return out;
     }
 
     /**
