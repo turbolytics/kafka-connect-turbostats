@@ -67,6 +67,13 @@ public class BundleSchemaTest {
         assertEquals("kafka-connect", doc.at("/instance/runtime").asText());
     }
 
+    // Control files a report by its kind. A Connect task is a pipeline.
+    @Test
+    void theInstanceDeclaresItIsAPipeline() throws Exception {
+        JsonNode doc = MAPPER.readTree(Fixtures.sourceBundle().toJson());
+        assertEquals("pipeline", doc.at("/instance/kind").asText());
+    }
+
     // The silent-loss fields reach the wire, zero included.
     @Test
     void droppedAndDivertedRowsAreSent() throws Exception {
