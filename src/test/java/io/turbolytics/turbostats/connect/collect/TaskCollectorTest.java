@@ -57,9 +57,10 @@ class TaskCollectorTest {
             if (configUnavailable) {
                 return Map.of();
             }
-            return Map.of("connector.class", connector.equals("customers-sink")
-                    ? "io.debezium.connector.jdbc.JdbcSinkConnector"
-                    : "io.debezium.connector.postgresql.PostgresConnector");
+            return connector.equals("customers-sink")
+                    ? Map.of("connector.class", "io.debezium.connector.jdbc.JdbcSinkConnector")
+                    : Map.of("connector.class", "io.debezium.connector.postgresql.PostgresConnector",
+                            "topic.prefix", "inventory");
         }
     }
 
@@ -81,7 +82,7 @@ class TaskCollectorTest {
         props.put("turbostats.report.to", "https://control.turbolytics.io/v1/turbostats");
         props.put("turbostats.key", "sfc_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8");
         ReporterConfig cfg = ReporterConfig.parse(props).config();
-        return new TaskCollector(cfg, new ConnectMetrics(jmx), cluster, () -> Fixtures.process().withHost(null),
+        return new TaskCollector(cfg, jmx, cluster, () -> Fixtures.process().withHost(null),
                 "3.9.0", warnings::add);
     }
 
@@ -92,6 +93,39 @@ class TaskCollectorTest {
                 .put(SRC_METRICS, "source-record-active-count", (double) active);
         cluster.tasks.put(SRC, new TaskHealth("RUNNING", "10.0.3.7:8083", "source"));
         cluster.connectorStates.put("inventory-cdc", "RUNNING");
+    }
+
+    static final String DBZ_SNAP = "debezium.postgres:type=connector-metrics,context=snapshot,server=inventory";
+    static final String DBZ_STREAM = "debezium.postgres:type=connector-metrics,context=streaming,server=inventory";
+
+    // The Cluster fake gives the source connector topic.prefix "inventory"
+    // and a Debezium class, so its metrics are found.
+    @Test
+    void aDebeziumSourceReportsBackfillLagAndConnection() {
+        runningSource(10, 10, 0);
+        jmx.put(DBZ_SNAP, "SnapshotCompleted", true).put(DBZ_SNAP, "TotalTableCount", 1)
+                .put(DBZ_SNAP, "RemainingTableCount", 0)
+                .put(DBZ_STREAM, "Connected", true).put(DBZ_STREAM, "MilliSecondsBehindSource", 250L)
+                .put(DBZ_STREAM, "MilliSecondsSinceLastEvent", 5000L)
+                .put("kafka.producer:type=producer-metrics,client-id=connector-producer-inventory-cdc-0",
+                        "outgoing-byte-total", 4096.0);
+        Bundle b = collector().collect(NOW).get(0);
+        assertEquals("completed", b.pipeline().backfill().state());
+        assertEquals(0.25, b.pipeline().eventLag().seconds());
+        assertEquals(Boolean.TRUE, b.pipeline().sourceConnected());
+        assertEquals(NOW.minusMillis(5000), b.pipeline().lastMessageAt());
+        assertEquals(4096L, b.pipeline().sinkWireBytes());
+    }
+
+    // A Debezium source always sends backfill; without metrics it is unknown.
+    @Test
+    void aDebeziumSourceWithoutMetricsSaysUnknown() {
+        runningSource(10, 10, 0);
+        Bundle b = collector().collect(NOW).get(0);
+        assertEquals("unknown", b.pipeline().backfill().state());
+        assertNull(b.pipeline().eventLag());
+        assertNull(b.pipeline().sourceConnected());
+        assertNull(b.pipeline().sinkWireBytes());
     }
 
     // Review focus: a worker with no tasks sends nothing.

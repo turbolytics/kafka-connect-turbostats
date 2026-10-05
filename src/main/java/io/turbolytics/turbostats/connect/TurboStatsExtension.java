@@ -2,7 +2,6 @@ package io.turbolytics.turbostats.connect;
 
 import io.turbolytics.turbostats.connect.collect.Cgroup;
 import io.turbolytics.turbostats.connect.collect.ConnectClusterView;
-import io.turbolytics.turbostats.connect.collect.ConnectMetrics;
 import io.turbolytics.turbostats.connect.collect.JvmProcess;
 import io.turbolytics.turbostats.connect.collect.PlatformJmx;
 import io.turbolytics.turbostats.connect.collect.TaskCollector;
@@ -66,7 +65,7 @@ public final class TurboStatsExtension implements ConnectRestExtension {
             ReporterConfig cfg = parsed.config();
             TaskCollector collector = new TaskCollector(
                     cfg,
-                    new ConnectMetrics(new PlatformJmx()),
+                    new PlatformJmx(),
                     new ConnectClusterView(ctx.clusterState()),
                     () -> JvmProcess.read(Cgroup.ROOT, Path.of("/proc/self/status")),
                     AppInfoParser.getVersion(),

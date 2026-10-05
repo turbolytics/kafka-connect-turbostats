@@ -3,7 +3,9 @@ package io.turbolytics.turbostats.connect.collect;
 import io.turbolytics.turbostats.connect.ReporterVersion;
 import io.turbolytics.turbostats.connect.config.ReporterConfig;
 import io.turbolytics.turbostats.connect.intercept.TaskCounters;
+import io.turbolytics.turbostats.connect.wire.Backfill;
 import io.turbolytics.turbostats.connect.wire.Bundle;
+import io.turbolytics.turbostats.connect.wire.EventLag;
 import io.turbolytics.turbostats.connect.wire.Exit;
 import io.turbolytics.turbostats.connect.wire.Instance;
 import io.turbolytics.turbostats.connect.wire.Pipeline;
@@ -39,6 +41,7 @@ public final class TaskCollector {
 
     private final ReporterConfig config;
     private final ConnectMetrics metrics;
+    private final DebeziumMetrics debezium;
     private final ClusterView cluster;
     private final Supplier<ProcessInfo> process;
     private final String runtimeVersion;
@@ -60,14 +63,19 @@ public final class TaskCollector {
     private record Pending(Bundle last, int ticks) {
     }
 
-    /** What a connector's config says, kept so a failed fetch never reads as a change. */
-    private record ConnectorFacts(String configHash, String type, long fetchedAt) {
+    /**
+     * What a connector's config says, kept so a failed fetch never reads as a
+     * change. topicPrefix names its Debezium metrics, when debezium is set.
+     */
+    private record ConnectorFacts(String configHash, String type, String topicPrefix, boolean debezium,
+            long fetchedAt) {
     }
 
-    public TaskCollector(ReporterConfig config, ConnectMetrics metrics, ClusterView cluster,
+    public TaskCollector(ReporterConfig config, Jmx jmx, ClusterView cluster,
             Supplier<ProcessInfo> process, String runtimeVersion, Consumer<String> warn) {
         this.config = config;
-        this.metrics = metrics;
+        this.metrics = new ConnectMetrics(jmx);
+        this.debezium = new DebeziumMetrics(jmx);
         this.cluster = cluster;
         this.process = process;
         this.runtimeVersion = runtimeVersion;
@@ -241,6 +249,29 @@ public final class TaskCollector {
             lastMessage = Instant.ofEpochMilli(counters.get().lastBatchMillis());
         }
 
+        ConnectorFacts f = facts(k.connector());
+        Backfill backfill = null;
+        EventLag eventLag = null;
+        Boolean sourceConnected = null;
+        if (!sink && f != null && f.debezium()) {
+            // Metrics registered before this task's start are the last
+            // run's; without a known start none can be judged stale.
+            DebeziumMetrics.View view = debezium.read(f.topicPrefix(), k, starts > 0 ? startMillis : 0);
+            backfill = DebeziumMetrics.backfill(view);
+            eventLag = DebeziumMetrics.eventLag(view, now);
+            sourceConnected = DebeziumMetrics.sourceConnected(view, backfill);
+            Instant event = DebeziumMetrics.lastEvent(view, now);
+            if (event != null) {
+                lastMessage = event;
+            }
+        }
+        Long sinkWireBytes = null;
+        if (!sink) {
+            OptionalLong out = metrics.clientBytes("kafka.producer", "producer-metrics",
+                    "connector-producer-" + k.connector() + "-" + k.task(), "outgoing-byte-total");
+            sinkWireBytes = out.isPresent() ? out.getAsLong() : null;
+        }
+
         long errors = metrics.total(ERRORS, k, "total-record-errors").orElse(0);
         OptionalLong lastErrorMillis = metrics.total(ERRORS, k, "last-error-timestamp");
         Instant lastError = lastErrorMillis.isPresent() && lastErrorMillis.getAsLong() > 0
@@ -252,7 +283,6 @@ public final class TaskCollector {
                 ? Math.max(0, dlqRequests.getAsLong() - metrics.total(ERRORS, k, "deadletterqueue-produce-failures").orElse(0))
                 : null;
 
-        ConnectorFacts f = facts(k.connector());
         String version = metrics.connectorVersion(k.connector()).orElse(null);
         if (version != null && !version.isEmpty()) {
             versions.put(k.connector(), version);
@@ -287,12 +317,12 @@ public final class TaskCollector {
                 lastError,
                 skipped.isPresent() ? skipped.getAsLong() : null,
                 dlq,
+                eventLag,
                 null,
+                backfill,
+                sourceConnected,
                 null,
-                null,
-                null,
-                null,
-                null);
+                sinkWireBytes);
 
         return new Bundle(now, config.intervalSeconds(), lastMessage, instance, jvm.withHost(h.workerId()), pipeline,
                 null);
@@ -313,8 +343,15 @@ public final class TaskCollector {
         if (c.isEmpty()) {
             return f;
         }
+        String cls = c.get("connector.class");
+        // Debezium 2 renamed database.server.name to topic.prefix; both name
+        // the server key of its metrics.
+        String prefix = c.getOrDefault("topic.prefix", c.get("database.server.name"));
         ConnectorFacts fresh = new ConnectorFacts(Identity.configHash(c, config.credential().configHashKey()),
-                Identity.typeOf(c.get("connector.class")), tick);
+                Identity.typeOf(cls), prefix,
+                prefix != null && cls != null && cls.startsWith("io.debezium.connector.")
+                        && !cls.startsWith("io.debezium.connector.jdbc."),
+                tick);
         facts.put(connector, fresh);
         return fresh;
     }
