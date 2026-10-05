@@ -87,4 +87,34 @@ class BrokerLagTest {
         f.ends.put(P0, 9L);
         assertTrue(new BrokerLag(() -> f, Duration.ofSeconds(1)).lags(Map.of("s", "connect-s"), NOW).isEmpty());
     }
+
+    // A broker that timed out for one connector is not asked about the
+    // rest this tick: each would wait out its own timeout.
+    @Test
+    void aTimeoutEndsTheTick() {
+        Fake f = new Fake();
+        f.timeout = true;
+        int[] asked = {0};
+        GroupAdmin counting = new GroupAdmin() {
+            public Map<String, Set<org.apache.kafka.common.TopicPartition>> assignments(String g, Duration t)
+                    throws Exception {
+                asked[0]++;
+                return f.assignments(g, t);
+            }
+
+            public Map<org.apache.kafka.common.TopicPartition, Long> committed(String g, Duration t) {
+                return Map.of();
+            }
+
+            public Map<org.apache.kafka.common.TopicPartition, Long> ends(Set<org.apache.kafka.common.TopicPartition> p,
+                    Duration t) {
+                return Map.of();
+            }
+
+            public void close() {
+            }
+        };
+        new BrokerLag(() -> counting, Duration.ofSeconds(1)).lags(Map.of("a", "connect-a", "b", "connect-b"), NOW);
+        assertEquals(1, asked[0]);
+    }
 }

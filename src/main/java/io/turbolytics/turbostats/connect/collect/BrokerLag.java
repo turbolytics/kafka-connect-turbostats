@@ -37,13 +37,14 @@ public final class BrokerLag {
                     admin = factory.get();
                 }
                 out.putAll(lags(e.getKey(), e.getValue(), now));
+            } catch (TimeoutException ex) {
+                // A slow broker is slow for every connector: asking about the
+                // rest would hold the tick for a timeout each. It is asked
+                // again next tick, on the same client.
+                break;
             } catch (Exception ex) {
-                // A slow broker is asked again next tick on the same client;
-                // anything else may be a broken client, so the next tick
-                // builds a fresh one.
-                if (!(ex instanceof TimeoutException)) {
-                    close();
-                }
+                // Possibly a broken client, so the next tick builds a fresh one.
+                close();
             }
         }
         return out;
