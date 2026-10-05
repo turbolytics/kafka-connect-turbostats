@@ -10,10 +10,21 @@ import javax.management.ObjectName;
 /** A map of MBeans, for tests that need Connect's metrics without a worker. */
 public final class FakeJmx implements Jmx {
     private final Map<ObjectName, Map<String, Object>> beans = new HashMap<>();
+    private final Map<ObjectName, Long> registered = new HashMap<>();
 
     public FakeJmx put(String objectName, String attribute, Object value) {
         try {
             beans.computeIfAbsent(new ObjectName(objectName), n -> new HashMap<>()).put(attribute, value);
+        } catch (MalformedObjectNameException e) {
+            throw new IllegalArgumentException(e);
+        }
+        return this;
+    }
+
+    /** Unset names never read as stale. */
+    public FakeJmx registeredAt(String objectName, long millis) {
+        try {
+            registered.put(new ObjectName(objectName), millis);
         } catch (MalformedObjectNameException e) {
             throw new IllegalArgumentException(e);
         }
@@ -49,5 +60,10 @@ public final class FakeJmx implements Jmx {
     public Object attribute(ObjectName name, String attribute) {
         Map<String, Object> attrs = beans.get(name);
         return attrs == null ? null : attrs.get(attribute);
+    }
+
+    @Override
+    public long registeredAt(ObjectName name) {
+        return registered.getOrDefault(name, Long.MAX_VALUE);
     }
 }
