@@ -82,4 +82,31 @@ public class BundleSchemaTest {
         ((ObjectNode) doc.get("pipeline")).remove("sink_rows_written");
         assertTrue(validate(doc.toString()).size() > 0);
     }
+
+    // The flattened lag fields and the backfill object are the contract's
+    // names, and validate.
+    @Test
+    void lagAndBackfillUseTheContractsNames() throws Exception {
+        JsonNode src = MAPPER.readTree(Fixtures.sourceBundle().toJson());
+        assertEquals("source_commit_time", src.at("/pipeline/event_lag_basis").asText());
+        assertEquals(0.8, src.at("/pipeline/event_lag_seconds").asDouble());
+        assertEquals("completed", src.at("/pipeline/backfill/state").asText());
+        assertEquals(3, src.at("/pipeline/backfill/units_total").asInt());
+        assertTrue(src.at("/pipeline/source_connected").asBoolean());
+        assertEquals(412_000, src.at("/pipeline/sink_wire_bytes").asLong());
+        JsonNode snk = MAPPER.readTree(Fixtures.sinkBundle().toJson());
+        assertEquals(274, snk.at("/pipeline/lag_max_messages").asLong());
+        assertEquals(4, snk.at("/pipeline/lag_partitions").asInt());
+        assertFalse(snk.get("pipeline").has("backfill"));
+        assertEquals(Set.of(), validate(Fixtures.sourceBundle().toJson()));
+        assertEquals(Set.of(), validate(Fixtures.sinkBundle().toJson()));
+    }
+
+    // A backfill whose metrics are missing says unknown, and validates.
+    @Test
+    void anUnknownBackfillValidates() throws Exception {
+        String json = new io.turbolytics.turbostats.connect.json.JsonObject()
+                .put("backfill", Backfill.unknown().toJson()).toJson();
+        assertEquals("{\"backfill\":{\"state\":\"unknown\",\"blocks_stream\":false}}", json);
+    }
 }

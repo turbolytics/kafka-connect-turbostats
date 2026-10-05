@@ -20,6 +20,14 @@ class JsonObjectTest {
         assertEquals("{\"a\":1}", new JsonObject().put("a", 1L).put("b", nothing).put("c", none).toJson());
     }
 
+    // Event lag is fractional seconds. A non-finite double is not JSON.
+    @Test
+    void doublesAreWrittenAndNonFiniteIsAbsent() {
+        Double nan = Double.NaN;
+        Double none = null;
+        assertEquals("{\"a\":1.5}", new JsonObject().put("a", 1.5).put("b", nan).put("c", none).toJson());
+    }
+
     @Test
     void anEmptyObjectIsBraces() {
         assertEquals("{}", new JsonObject().toJson());

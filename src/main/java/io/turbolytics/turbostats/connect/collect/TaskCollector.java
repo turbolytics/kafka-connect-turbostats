@@ -286,7 +286,13 @@ public final class TaskCollector {
                 lastWrite,
                 lastError,
                 skipped.isPresent() ? skipped.getAsLong() : null,
-                dlq);
+                dlq,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null);
 
         return new Bundle(now, config.intervalSeconds(), lastMessage, instance, jvm.withHost(h.workerId()), pipeline,
                 null);
