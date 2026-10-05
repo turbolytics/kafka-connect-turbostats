@@ -8,6 +8,7 @@ import io.turbolytics.turbostats.connect.wire.Bundle;
 import io.turbolytics.turbostats.connect.wire.EventLag;
 import io.turbolytics.turbostats.connect.wire.Exit;
 import io.turbolytics.turbostats.connect.wire.Instance;
+import io.turbolytics.turbostats.connect.wire.MessageLag;
 import io.turbolytics.turbostats.connect.wire.Pipeline;
 import io.turbolytics.turbostats.connect.wire.ProcessInfo;
 import java.time.Instant;
@@ -46,6 +47,8 @@ public final class TaskCollector {
     private final Supplier<ProcessInfo> process;
     private final String runtimeVersion;
     private final Consumer<String> warn;
+    private final BrokerLag brokerLag;
+    private Map<TaskKey, MessageLag> lags = Map.of();
 
     private final Map<TaskKey, Bundle> last = new HashMap<>();
     private final Map<TaskKey, Seen> seen = new HashMap<>();
@@ -68,11 +71,11 @@ public final class TaskCollector {
      * change. topicPrefix names its Debezium metrics, when debezium is set.
      */
     private record ConnectorFacts(String configHash, String type, String topicPrefix, boolean debezium,
-            long fetchedAt) {
+            String group, long fetchedAt) {
     }
 
     public TaskCollector(ReporterConfig config, Jmx jmx, ClusterView cluster,
-            Supplier<ProcessInfo> process, String runtimeVersion, Consumer<String> warn) {
+            Supplier<ProcessInfo> process, String runtimeVersion, Consumer<String> warn, BrokerLag brokerLag) {
         this.config = config;
         this.metrics = new ConnectMetrics(jmx);
         this.debezium = new DebeziumMetrics(jmx);
@@ -80,6 +83,7 @@ public final class TaskCollector {
         this.process = process;
         this.runtimeVersion = runtimeVersion;
         this.warn = warn;
+        this.brokerLag = brokerLag;
     }
 
     public List<Bundle> collect(Instant now) {
@@ -87,6 +91,7 @@ public final class TaskCollector {
         List<Bundle> out = new ArrayList<>();
         Set<TaskKey> local = new HashSet<>(metrics.localTasks());
         ProcessInfo jvm = local.isEmpty() ? null : process.get();
+        lags = sinkLags(local, now);
         for (TaskKey k : local) {
             pending.remove(k);
             try {
@@ -266,7 +271,17 @@ public final class TaskCollector {
             }
         }
         Long sinkWireBytes = null;
-        if (!sink) {
+        Long sourceWireBytes = null;
+        if (sink) {
+            OptionalLong in = metrics.clientBytes("kafka.consumer", "consumer-fetch-manager-metrics",
+                    "connector-consumer-" + k.connector() + "-" + k.task(), "bytes-consumed-total");
+            sourceWireBytes = in.isPresent() ? in.getAsLong() : null;
+            TaskCounters.Snapshot c = counters.orElse(null);
+            if (c != null && c.eventLagMillis() >= 0) {
+                eventLag = new EventLag(c.eventLagMillis() / 1000.0, c.maxEventLagMillis() / 1000.0,
+                        Instant.ofEpochMilli(c.eventObservedMillis()), c.timestampBasis());
+            }
+        } else {
             OptionalLong out = metrics.clientBytes("kafka.producer", "producer-metrics",
                     "connector-producer-" + k.connector() + "-" + k.task(), "outgoing-byte-total");
             sinkWireBytes = out.isPresent() ? out.getAsLong() : null;
@@ -318,14 +333,40 @@ public final class TaskCollector {
                 skipped.isPresent() ? skipped.getAsLong() : null,
                 dlq,
                 eventLag,
-                null,
+                sink ? lags.get(k) : null,
                 backfill,
                 sourceConnected,
-                null,
+                sourceWireBytes,
                 sinkWireBytes);
 
         return new Bundle(now, config.intervalSeconds(), lastMessage, instance, jvm.withHost(h.workerId()), pipeline,
                 null);
+    }
+
+    /**
+     * Broker lag for every local sink connector, asked once per tick. A sink
+     * connector's group is connect-<name> unless its config overrides it.
+     */
+    private Map<TaskKey, MessageLag> sinkLags(Set<TaskKey> local, Instant now) {
+        if (brokerLag == null) {
+            return Map.of();
+        }
+        Map<String, String> groups = new HashMap<>();
+        for (TaskKey k : local) {
+            if (groups.containsKey(k.connector())) {
+                continue;
+            }
+            try {
+                Optional<TaskHealth> h = cluster.task(k);
+                if (h.isPresent() && "sink".equals(h.get().connectorType())) {
+                    ConnectorFacts f = facts(k.connector());
+                    groups.put(k.connector(), f != null && f.group() != null ? f.group() : "connect-" + k.connector());
+                }
+            } catch (RuntimeException ignored) {
+                // The task's own bundle reports what it can without lag.
+            }
+        }
+        return groups.isEmpty() ? Map.of() : brokerLag.lags(groups, now);
     }
 
     /**
@@ -351,6 +392,7 @@ public final class TaskCollector {
                 Identity.typeOf(cls), prefix,
                 prefix != null && cls != null && cls.startsWith("io.debezium.connector.")
                         && !cls.startsWith("io.debezium.connector.jdbc."),
+                c.get("consumer.override.group.id"),
                 tick);
         facts.put(connector, fresh);
         return fresh;

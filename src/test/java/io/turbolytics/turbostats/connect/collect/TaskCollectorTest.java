@@ -82,8 +82,12 @@ class TaskCollectorTest {
         props.put("turbostats.report.to", "https://control.turbolytics.io/v1/turbostats");
         props.put("turbostats.key", "sfc_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8");
         ReporterConfig cfg = ReporterConfig.parse(props).config();
+        BrokerLagTest.Fake broker = new BrokerLagTest.Fake();
+        broker.members.put("connector-consumer-customers-sink-0", java.util.Set.of(P0, P1));
+        broker.committed.putAll(Map.of(P0, 3L, P1, 4L));
+        broker.ends.putAll(Map.of(P0, 10L, P1, 6L));
         return new TaskCollector(cfg, jmx, cluster, () -> Fixtures.process().withHost(null),
-                "3.9.0", warnings::add);
+                "3.9.0", warnings::add, new BrokerLag(() -> broker, java.time.Duration.ofSeconds(1)));
     }
 
     void runningSource(long poll, long write, long active) {
@@ -93,6 +97,30 @@ class TaskCollectorTest {
                 .put(SRC_METRICS, "source-record-active-count", (double) active);
         cluster.tasks.put(SRC, new TaskHealth("RUNNING", "10.0.3.7:8083", "source"));
         cluster.connectorStates.put("inventory-cdc", "RUNNING");
+    }
+
+    static final org.apache.kafka.common.TopicPartition P0 = new org.apache.kafka.common.TopicPartition("c", 0);
+    static final org.apache.kafka.common.TopicPartition P1 = new org.apache.kafka.common.TopicPartition("c", 1);
+
+    // The broker's lag for the task's partitions, the consumer's event lag,
+    // and the bytes it fetched.
+    @Test
+    void aSinkReportsBrokerLagEventLagAndWireBytes() {
+        new io.turbolytics.turbostats.connect.intercept.ConsumeInterceptor()
+                .configure(Map.of("client.id", "connector-consumer-customers-sink-0"));
+        jmx.put(SNK_TASK, "status", "running")
+                .put(SNK_METRICS, "sink-record-read-total", 10.0)
+                .put(SNK_METRICS, "sink-record-send-total", 10.0)
+                .put("kafka.consumer:type=consumer-fetch-manager-metrics,client-id=connector-consumer-customers-sink-0",
+                        "bytes-consumed-total", 2048.0);
+        cluster.tasks.put(SNK, new TaskHealth("RUNNING", "10.0.3.8:8083", "sink"));
+        cluster.connectorStates.put("customers-sink", "RUNNING");
+        Bundle b = collector().collect(NOW).get(0);
+        assertEquals(new io.turbolytics.turbostats.connect.wire.MessageLag(7, 9, 2, NOW), b.pipeline().messageLag());
+        assertEquals(2048L, b.pipeline().sourceWireBytes());
+        assertNull(b.pipeline().backfill());
+        // No batch yet: no event lag.
+        assertNull(b.pipeline().eventLag());
     }
 
     static final String DBZ_SNAP = "debezium.postgres:type=connector-metrics,context=snapshot,server=inventory";

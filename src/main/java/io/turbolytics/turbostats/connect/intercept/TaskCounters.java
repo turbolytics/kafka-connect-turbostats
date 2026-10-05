@@ -29,6 +29,14 @@ public final class TaskCounters {
     private volatile long lastConsumerStartMillis;
     private volatile long lastAckMillis;
     private volatile long lastBatchMillis;
+    // -1 until a batch carries a timestamp. The three event fields are
+    // written together on the task's thread and read on the reporter's, so a
+    // read can pair one batch's lag with the next batch's time: both are
+    // within one poll of each other.
+    private volatile long eventLagMillis = -1;
+    private volatile long maxEventLagMillis = -1;
+    private volatile long eventObservedMillis;
+    private volatile String timestampBasis;
 
     public record Snapshot(
             long producerStarts,
@@ -38,7 +46,11 @@ public final class TaskCounters {
             long sent,
             long acked,
             long lastAckMillis,
-            long lastBatchMillis) {
+            long lastBatchMillis,
+            long eventLagMillis,
+            long maxEventLagMillis,
+            long eventObservedMillis,
+            String timestampBasis) {
     }
 
     public static TaskCounters of(TaskKey k) {
@@ -77,6 +89,10 @@ public final class TaskCounters {
 
     void consumerStarted(long nowMillis) {
         lastBatchMillis = 0;
+        eventLagMillis = -1;
+        maxEventLagMillis = -1;
+        eventObservedMillis = 0;
+        timestampBasis = null;
         lastConsumerStartMillis = nowMillis;
         consumerStarts.incrementAndGet();
     }
@@ -94,8 +110,16 @@ public final class TaskCounters {
         lastBatchMillis = nowMillis;
     }
 
+    void event(long lagMillis, long nowMillis, String basis) {
+        eventLagMillis = lagMillis;
+        maxEventLagMillis = Math.max(maxEventLagMillis, lagMillis);
+        eventObservedMillis = nowMillis;
+        timestampBasis = basis;
+    }
+
     public Snapshot snapshot() {
         return new Snapshot(producerStarts.get(), lastProducerStartMillis, consumerStarts.get(),
-                lastConsumerStartMillis, sent.get(), acked.get(), lastAckMillis, lastBatchMillis);
+                lastConsumerStartMillis, sent.get(), acked.get(), lastAckMillis, lastBatchMillis, eventLagMillis,
+                maxEventLagMillis, eventObservedMillis, timestampBasis);
     }
 }
