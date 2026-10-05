@@ -1,9 +1,11 @@
 package io.turbolytics.turbostats.connect;
 
+import io.turbolytics.turbostats.connect.collect.AdminSettings;
+import io.turbolytics.turbostats.connect.collect.BrokerLag;
 import io.turbolytics.turbostats.connect.collect.Cgroup;
 import io.turbolytics.turbostats.connect.collect.ConnectClusterView;
-import io.turbolytics.turbostats.connect.collect.ConnectMetrics;
 import io.turbolytics.turbostats.connect.collect.JvmProcess;
+import io.turbolytics.turbostats.connect.collect.KafkaGroupAdmin;
 import io.turbolytics.turbostats.connect.collect.PlatformJmx;
 import io.turbolytics.turbostats.connect.collect.TaskCollector;
 import io.turbolytics.turbostats.connect.config.ReporterConfig;
@@ -34,6 +36,8 @@ public final class TurboStatsExtension implements ConnectRestExtension {
 
     private ReporterConfig.Parsed parsed;
     private ScheduledExecutorService scheduler;
+    private Map<String, ?> worker = Map.of();
+    private BrokerLag brokerLag;
 
     @Override
     public void configure(Map<String, ?> configs) {
@@ -43,6 +47,7 @@ public final class TurboStatsExtension implements ConnectRestExtension {
                         + "(/kafka/libs in the Debezium image): from the plugin path the interceptors cannot load, "
                         + "and every source task on this worker fails to build its producer");
             }
+            worker = configs == null ? Map.of() : new java.util.HashMap<>(configs);
             parsed = ReporterConfig.parse(configs);
             parsed.warnings().forEach(w -> LOG.warn("turbostats: " + w));
             parsed.errors().forEach(e -> LOG.warn("turbostats: " + e));
@@ -64,13 +69,19 @@ public final class TurboStatsExtension implements ConnectRestExtension {
                 return;
             }
             ReporterConfig cfg = parsed.config();
+            // Built on the first tick that needs it, so a worker without sink
+            // connectors never opens a connection for it.
+            Map<String, ?> settings = worker;
+            brokerLag = new BrokerLag(() -> new KafkaGroupAdmin(AdminSettings.from(settings)),
+                    Duration.ofSeconds(cfg.timeoutSeconds()), LOG::warn);
             TaskCollector collector = new TaskCollector(
                     cfg,
-                    new ConnectMetrics(new PlatformJmx()),
+                    new PlatformJmx(),
                     new ConnectClusterView(ctx.clusterState()),
                     () -> JvmProcess.read(Cgroup.ROOT, Path.of("/proc/self/status")),
                     AppInfoParser.getVersion(),
-                    LOG::warn);
+                    LOG::warn,
+                    brokerLag);
             Sender sender = new Sender(cfg.reportTo(), cfg.credential(), Duration.ofSeconds(cfg.timeoutSeconds()));
             Reporter reporter = new Reporter(() -> collector.collect(Clock.systemUTC().instant()), sender::send, LOG,
                     Clock.systemUTC());
@@ -92,6 +103,9 @@ public final class TurboStatsExtension implements ConnectRestExtension {
         try {
             if (scheduler != null) {
                 scheduler.shutdownNow();
+            }
+            if (brokerLag != null) {
+                brokerLag.close();
             }
         } catch (Throwable ignored) {
             // Shutting down; nothing to report to.

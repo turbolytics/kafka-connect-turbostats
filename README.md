@@ -51,6 +51,10 @@ One report per task, under the id `<cluster>/<connector>/<task>`:
 - Restarts: how many times the task started on this worker since it arrived here, after the first, and when it last started. A task that moves away and comes back starts counting afresh.
 - Records read and written. A source task's written count is what the broker acknowledged. A sink task's is records read less records in flight, which also counts records a transform dropped, so it is a ceiling on rows delivered.
 - Records discarded under `errors.tolerance=all`, and records sent to a dead letter queue.
+- Event lag: how far behind the stream the task runs, in seconds, and what that is measured from. A Debezium source measures from the database's commit time. A sink measures from the record's Kafka timestamp.
+- For a Debezium source, the snapshot's progress and whether the database connection is up. A task restarted mid-snapshot reports the snapshot as `unknown`, because Debezium does not register the restarted task's snapshot metrics.
+- For a sink, its lag in messages, asked of the broker for the partitions the task holds. The reporter connects with the worker's own `bootstrap.servers`, `security.protocol`, `sasl.*` and `ssl.*` settings, and `admin.*` overrides, and needs permission to describe the sink's consumer group.
+- Bytes the task's Kafka client sent or fetched.
 - The worker's uptime, memory, garbage collections and container limit.
 - The connector's type and a hash of its config, keyed by your credential. The config itself never leaves the worker: it holds your database password. The keyed hash means nothing outside your install, and cannot be checked against a guessed password.
 

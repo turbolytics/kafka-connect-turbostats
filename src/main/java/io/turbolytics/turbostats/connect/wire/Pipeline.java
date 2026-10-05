@@ -7,7 +7,9 @@ import java.time.Instant;
  * The pipeline section for one task. The six primitive counters are
  * required by v1. sinkFlushCount is null: a source task never flushes in
  * batches, and a sink's commit counter rises even when nothing was written.
- * errorRowsDropped and dlqRows are null when Connect reports neither.
+ * errorRowsDropped and dlqRows are null when Connect reports neither. The
+ * lag, backfill and wire fields are null when the task's connector or the
+ * broker does not report them.
  */
 public record Pipeline(
         String state,
@@ -24,16 +26,23 @@ public record Pipeline(
         Instant lastSinkWriteAt,
         Instant lastErrorAt,
         Long errorRowsDropped,
-        Long dlqRows) {
+        Long dlqRows,
+        EventLag eventLag,
+        MessageLag messageLag,
+        Backfill backfill,
+        Boolean sourceConnected,
+        Long sourceWireBytes,
+        Long sinkWireBytes) {
 
     public Pipeline withState(String newState) {
         return new Pipeline(newState, startedAt, restartCount, messageCount, handlerRowsRead, errorCount,
                 sinkFlushCount, sinkRowsAccepted, sinkRowsWritten, stateCommitCount, lastMessageAt,
-                lastSinkWriteAt, lastErrorAt, errorRowsDropped, dlqRows);
+                lastSinkWriteAt, lastErrorAt, errorRowsDropped, dlqRows, eventLag, messageLag, backfill,
+                sourceConnected, sourceWireBytes, sinkWireBytes);
     }
 
     public JsonObject toJson() {
-        return new JsonObject()
+        JsonObject o = new JsonObject()
                 .put("state", state)
                 .put("started_at", startedAt)
                 .put("restart_count", restartCount)
@@ -49,5 +58,15 @@ public record Pipeline(
                 .put("last_error_at", lastErrorAt)
                 .put("error_rows_dropped", errorRowsDropped)
                 .put("dlq_rows", dlqRows);
+        if (eventLag != null) {
+            eventLag.writeInto(o);
+        }
+        if (messageLag != null) {
+            messageLag.writeInto(o);
+        }
+        return o.put("backfill", backfill == null ? null : backfill.toJson())
+                .put("source_connected", sourceConnected)
+                .put("source_wire_bytes", sourceWireBytes)
+                .put("sink_wire_bytes", sinkWireBytes);
     }
 }

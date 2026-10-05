@@ -110,6 +110,9 @@ class WorkerReleaseIT {
                 .withEnv("CONFIG_STORAGE_REPLICATION_FACTOR", "1")
                 .withEnv("OFFSET_STORAGE_REPLICATION_FACTOR", "1")
                 .withEnv("STATUS_STORAGE_REPLICATION_FACTOR", "1")
+                // Sink lag needs committed offsets; Connect commits every
+                // minute by default, too slow for the await.
+                .withEnv("OFFSET_FLUSH_INTERVAL_MS", "2000")
                 .withEnv("CONNECT_REST_EXTENSION_CLASSES", "io.turbolytics.turbostats.connect.TurboStatsExtension")
                 .withEnv("CONNECT_PRODUCER_INTERCEPTOR_CLASSES", "io.turbolytics.turbostats.connect.intercept.AckInterceptor")
                 .withEnv("CONNECT_CONSUMER_INTERCEPTOR_CLASSES", "io.turbolytics.turbostats.connect.intercept.ConsumeInterceptor")
@@ -217,7 +220,9 @@ class WorkerReleaseIT {
 
     @Test
     void aRunningConnectorReportsSignedValidBundles() throws Exception {
-        assertEquals(201, rest("PUT", "/connectors/inventory-cdc/config", connector("inventory-cdc", "postgres")));
+        // The sink test may have created it first: 200 then, 201 here.
+        int created = rest("PUT", "/connectors/inventory-cdc/config", connector("inventory-cdc", "postgres"));
+        assertTrue(created == 200 || created == 201, "source " + created);
         JsonNode post = await(b -> is(b, "itest/inventory-cdc/0")
                 && b.at("/pipeline/state").asText().equals("running")
                 && b.at("/pipeline/sink_rows_written").asLong() >= 1000);
@@ -247,6 +252,44 @@ class WorkerReleaseIT {
         assertTrue(!b.get("pipeline").has("sink_flush_count"));
         assertEquals(0, b.at("/pipeline/restart_count").asLong());
         assertTrue(b.at("/pipeline/sink_rows_written").asLong() <= b.at("/pipeline/sink_rows_accepted").asLong());
+
+        // Streaming begins after the snapshot; a change gives Debezium an
+        // event to measure lag from.
+        exec(postgres, "psql", "-U", "postgres", "-c",
+                "INSERT INTO customers (name) SELECT 'streamed' || g FROM generate_series(1, 100) g;");
+        JsonNode s = body(await(x -> is(x, "itest/inventory-cdc/0")
+                && x.at("/pipeline/event_lag_basis").asText().equals("source_commit_time")));
+        assertEquals("completed", s.at("/pipeline/backfill/state").asText());
+        assertEquals(1, s.at("/pipeline/backfill/units_total").asInt());
+        assertTrue(s.at("/pipeline/source_connected").asBoolean());
+        assertTrue(s.at("/pipeline/sink_wire_bytes").asLong() > 0);
+        assertTrue(s.at("/pipeline/event_lag_seconds").asDouble(-1) >= 0);
+        try (InputStream in = getClass().getResourceAsStream("/schema/bundle.schema.json")) {
+            JsonSchema schema = JsonSchemaFactory.getInstance(SpecVersion.VersionFlag.V202012).getSchema(in);
+            assertEquals(0, schema.validate(s).size(), schema.validate(s).toString());
+        }
+    }
+
+    // A sink's lag comes from the broker, its event lag from record
+    // timestamps, and its wire bytes from its consumer.
+    @Test
+    void aSinkReportsLagFromTheBroker() throws Exception {
+        int created = rest("PUT", "/connectors/inventory-cdc/config", connector("inventory-cdc", "postgres"));
+        assertTrue(created == 200 || created == 201, "source " + created);
+        assertEquals(201, rest("PUT", "/connectors/customers-sink/config",
+                "{\"connector.class\":\"io.debezium.connector.jdbc.JdbcSinkConnector\","
+                        + "\"connection.url\":\"jdbc:postgresql://postgres:5432/postgres\","
+                        + "\"connection.username\":\"postgres\",\"connection.password\":\"postgres\","
+                        + "\"topics\":\"inventory-cdc.public.customers\",\"insert.mode\":\"upsert\","
+                        + "\"primary.key.mode\":\"record_key\",\"schema.evolution\":\"basic\","
+                        + "\"table.name.format\":\"customers_copy\",\"tasks.max\":\"1\"}"));
+        JsonNode b = body(await(x -> is(x, "itest/customers-sink/0")
+                && x.at("/pipeline/lag_partitions").asInt() >= 1
+                && x.at("/pipeline/event_lag_basis").asText().equals("kafka_create_time")));
+        assertTrue(b.has("pipeline") && b.at("/pipeline/lag_observed_at").isTextual());
+        assertTrue(b.at("/pipeline/lag_total_messages").asLong(-1) >= 0);
+        assertTrue(b.at("/pipeline/source_wire_bytes").asLong() > 0);
+        assertTrue(!b.get("pipeline").has("backfill"));
     }
 
     // The failure this reporter exists for: a failed task on a live worker.

@@ -38,6 +38,21 @@ public final class JsonObject {
         return this;
     }
 
+    /** Absent for null, and for NaN or infinity, which JSON cannot write. */
+    public JsonObject put(String key, Double value) {
+        if (value != null && Double.isFinite(value)) {
+            field(key).append(value.doubleValue());
+        }
+        return this;
+    }
+
+    public JsonObject put(String key, Boolean value) {
+        if (value != null) {
+            field(key).append(value.booleanValue());
+        }
+        return this;
+    }
+
     public JsonObject put(String key, boolean value) {
         field(key).append(value);
         return this;

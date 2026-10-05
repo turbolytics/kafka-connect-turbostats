@@ -46,6 +46,23 @@ public final class ConnectMetrics {
         return OptionalLong.of((long) num.doubleValue());
     }
 
+    /**
+     * A Kafka client's byte total, from its client-level MBean: the one for
+     * this client id without a topic or node key.
+     */
+    public OptionalLong clientBytes(String domain, String type, String clientId, String attribute) {
+        for (ObjectName n : jmx.query(domain + ":type=" + type + ",*")) {
+            if (!clientId.equals(unquote(n.getKeyProperty("client-id"))) || n.getKeyPropertyList().size() != 2) {
+                continue;
+            }
+            Object v = jmx.attribute(n, attribute);
+            if (v instanceof Number num && !Double.isNaN(num.doubleValue())) {
+                return OptionalLong.of((long) num.doubleValue());
+            }
+        }
+        return OptionalLong.empty();
+    }
+
     /** Registered on the worker that runs the connector itself, which may be another. */
     public Optional<String> connectorVersion(String connector) {
         ObjectName n = find("connector-metrics", connector, null);

@@ -3,9 +3,12 @@ package io.turbolytics.turbostats.connect.collect;
 import io.turbolytics.turbostats.connect.ReporterVersion;
 import io.turbolytics.turbostats.connect.config.ReporterConfig;
 import io.turbolytics.turbostats.connect.intercept.TaskCounters;
+import io.turbolytics.turbostats.connect.wire.Backfill;
 import io.turbolytics.turbostats.connect.wire.Bundle;
+import io.turbolytics.turbostats.connect.wire.EventLag;
 import io.turbolytics.turbostats.connect.wire.Exit;
 import io.turbolytics.turbostats.connect.wire.Instance;
+import io.turbolytics.turbostats.connect.wire.MessageLag;
 import io.turbolytics.turbostats.connect.wire.Pipeline;
 import io.turbolytics.turbostats.connect.wire.ProcessInfo;
 import java.time.Instant;
@@ -39,10 +42,13 @@ public final class TaskCollector {
 
     private final ReporterConfig config;
     private final ConnectMetrics metrics;
+    private final DebeziumMetrics debezium;
     private final ClusterView cluster;
     private final Supplier<ProcessInfo> process;
     private final String runtimeVersion;
     private final Consumer<String> warn;
+    private final BrokerLag brokerLag;
+    private Map<TaskKey, MessageLag> lags = Map.of();
 
     private final Map<TaskKey, Bundle> last = new HashMap<>();
     private final Map<TaskKey, Seen> seen = new HashMap<>();
@@ -51,6 +57,8 @@ public final class TaskCollector {
     private final Map<String, String> versions = new HashMap<>();
     private final Set<TaskKey> warnedBrokenAcks = new HashSet<>();
     private final Set<TaskKey> warnedUnreadable = new HashSet<>();
+    private final Set<String> warnedSharedPrefix = new HashSet<>();
+    private Set<String> sharedPrefixes = Set.of();
     private long tick;
 
     private record Seen(long input, Instant inputChangedAt, long written, Instant writtenChangedAt,
@@ -60,18 +68,24 @@ public final class TaskCollector {
     private record Pending(Bundle last, int ticks) {
     }
 
-    /** What a connector's config says, kept so a failed fetch never reads as a change. */
-    private record ConnectorFacts(String configHash, String type, long fetchedAt) {
+    /**
+     * What a connector's config says, kept so a failed fetch never reads as a
+     * change. topicPrefix names its Debezium metrics, when debezium is set.
+     */
+    private record ConnectorFacts(String configHash, String type, String topicPrefix, boolean debezium,
+            String group, long fetchedAt) {
     }
 
-    public TaskCollector(ReporterConfig config, ConnectMetrics metrics, ClusterView cluster,
-            Supplier<ProcessInfo> process, String runtimeVersion, Consumer<String> warn) {
+    public TaskCollector(ReporterConfig config, Jmx jmx, ClusterView cluster,
+            Supplier<ProcessInfo> process, String runtimeVersion, Consumer<String> warn, BrokerLag brokerLag) {
         this.config = config;
-        this.metrics = metrics;
+        this.metrics = new ConnectMetrics(jmx);
+        this.debezium = new DebeziumMetrics(jmx);
         this.cluster = cluster;
         this.process = process;
         this.runtimeVersion = runtimeVersion;
         this.warn = warn;
+        this.brokerLag = brokerLag;
     }
 
     public List<Bundle> collect(Instant now) {
@@ -79,6 +93,8 @@ public final class TaskCollector {
         List<Bundle> out = new ArrayList<>();
         Set<TaskKey> local = new HashSet<>(metrics.localTasks());
         ProcessInfo jvm = local.isEmpty() ? null : process.get();
+        lags = sinkLags(local, now);
+        sharedPrefixes = sharedPrefixes(local);
         for (TaskKey k : local) {
             pending.remove(k);
             try {
@@ -241,6 +257,50 @@ public final class TaskCollector {
             lastMessage = Instant.ofEpochMilli(counters.get().lastBatchMillis());
         }
 
+        ConnectorFacts f = facts(k.connector());
+        Backfill backfill = null;
+        EventLag eventLag = null;
+        Boolean sourceConnected = null;
+        if (!sink && f != null && f.debezium()) {
+            // Metrics registered before this task's start are the last
+            // run's. Without a known start, which the interceptors record,
+            // none count as current.
+            DebeziumMetrics.View view;
+            if (sharedPrefixes.contains(f.topicPrefix())) {
+                if (warnedSharedPrefix.add(k.connector())) {
+                    warn.accept("turbostats: " + k.connector() + " shares topic.prefix " + f.topicPrefix()
+                            + " with another connector on this worker. Debezium's metrics cannot tell them apart, "
+                            + "so its snapshot, event lag and connection are unknown");
+                }
+                view = DebeziumMetrics.View.UNKNOWN;
+            } else {
+                view = debezium.read(f.topicPrefix(), k, starts > 0 ? startMillis : 0);
+            }
+            backfill = DebeziumMetrics.backfill(view);
+            eventLag = DebeziumMetrics.eventLag(view, now);
+            sourceConnected = DebeziumMetrics.sourceConnected(view, backfill);
+            Instant event = DebeziumMetrics.lastEvent(view, now);
+            if (event != null) {
+                lastMessage = event;
+            }
+        }
+        Long sinkWireBytes = null;
+        Long sourceWireBytes = null;
+        if (sink) {
+            OptionalLong in = metrics.clientBytes("kafka.consumer", "consumer-fetch-manager-metrics",
+                    "connector-consumer-" + k.connector() + "-" + k.task(), "bytes-consumed-total");
+            sourceWireBytes = in.isPresent() ? in.getAsLong() : null;
+            TaskCounters.Snapshot c = counters.orElse(null);
+            if (c != null && c.eventLagMillis() >= 0) {
+                eventLag = new EventLag(c.eventLagMillis() / 1000.0, c.maxEventLagMillis() / 1000.0,
+                        Instant.ofEpochMilli(c.eventObservedMillis()), c.timestampBasis());
+            }
+        } else {
+            OptionalLong out = metrics.clientBytes("kafka.producer", "producer-metrics",
+                    "connector-producer-" + k.connector() + "-" + k.task(), "outgoing-byte-total");
+            sinkWireBytes = out.isPresent() ? out.getAsLong() : null;
+        }
+
         long errors = metrics.total(ERRORS, k, "total-record-errors").orElse(0);
         OptionalLong lastErrorMillis = metrics.total(ERRORS, k, "last-error-timestamp");
         Instant lastError = lastErrorMillis.isPresent() && lastErrorMillis.getAsLong() > 0
@@ -252,7 +312,6 @@ public final class TaskCollector {
                 ? Math.max(0, dlqRequests.getAsLong() - metrics.total(ERRORS, k, "deadletterqueue-produce-failures").orElse(0))
                 : null;
 
-        ConnectorFacts f = facts(k.connector());
         String version = metrics.connectorVersion(k.connector()).orElse(null);
         if (version != null && !version.isEmpty()) {
             versions.put(k.connector(), version);
@@ -286,10 +345,70 @@ public final class TaskCollector {
                 lastWrite,
                 lastError,
                 skipped.isPresent() ? skipped.getAsLong() : null,
-                dlq);
+                dlq,
+                eventLag,
+                sink ? lags.get(k) : null,
+                backfill,
+                sourceConnected,
+                sourceWireBytes,
+                sinkWireBytes);
 
         return new Bundle(now, config.intervalSeconds(), lastMessage, instance, jvm.withHost(h.workerId()), pipeline,
                 null);
+    }
+
+    /**
+     * Broker lag for every local sink connector, asked once per tick. A sink
+     * connector's group is connect-<name> unless its config overrides it.
+     */
+    private Map<TaskKey, MessageLag> sinkLags(Set<TaskKey> local, Instant now) {
+        if (brokerLag == null) {
+            return Map.of();
+        }
+        Map<String, String> groups = new HashMap<>();
+        for (TaskKey k : local) {
+            if (groups.containsKey(k.connector())) {
+                continue;
+            }
+            try {
+                Optional<TaskHealth> h = cluster.task(k);
+                if (h.isPresent() && "sink".equals(h.get().connectorType())) {
+                    ConnectorFacts f = facts(k.connector());
+                    groups.put(k.connector(), f != null && f.group() != null ? f.group() : "connect-" + k.connector());
+                }
+            } catch (RuntimeException ignored) {
+                // The task's own bundle reports what it can without lag.
+            }
+        }
+        return groups.isEmpty() ? Map.of() : brokerLag.lags(groups, now);
+    }
+
+    /**
+     * Debezium registers one set of metrics per topic.prefix, and refuses a
+     * second connector's under the same name, so local connectors sharing a
+     * prefix would read each other's.
+     */
+    private Set<String> sharedPrefixes(Set<TaskKey> local) {
+        Map<String, Set<String>> byPrefix = new HashMap<>();
+        Set<String> connectors = new HashSet<>();
+        local.forEach(k -> connectors.add(k.connector()));
+        for (String c : connectors) {
+            try {
+                ConnectorFacts f = facts(c);
+                if (f != null && f.debezium()) {
+                    byPrefix.computeIfAbsent(f.topicPrefix(), x -> new HashSet<>()).add(c);
+                }
+            } catch (RuntimeException ignored) {
+                // The connector's own bundle reports what it can.
+            }
+        }
+        Set<String> out = new HashSet<>();
+        byPrefix.forEach((p, cs) -> {
+            if (cs.size() > 1) {
+                out.add(p);
+            }
+        });
+        return out;
     }
 
     /**
@@ -307,8 +426,16 @@ public final class TaskCollector {
         if (c.isEmpty()) {
             return f;
         }
+        String cls = c.get("connector.class");
+        // Debezium 2 renamed database.server.name to topic.prefix; both name
+        // the server key of its metrics.
+        String prefix = c.getOrDefault("topic.prefix", c.get("database.server.name"));
         ConnectorFacts fresh = new ConnectorFacts(Identity.configHash(c, config.credential().configHashKey()),
-                Identity.typeOf(c.get("connector.class")), tick);
+                Identity.typeOf(cls), prefix,
+                prefix != null && cls != null && cls.startsWith("io.debezium.connector.")
+                        && !cls.startsWith("io.debezium.connector.jdbc."),
+                c.get("consumer.override.group.id"),
+                tick);
         facts.put(connector, fresh);
         return fresh;
     }
