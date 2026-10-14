@@ -46,7 +46,7 @@ import org.testcontainers.utility.MountableFile;
 class WorkerReleaseIT {
     static final ObjectMapper MAPPER = new ObjectMapper();
     static final String KEY = "sfc_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
-    static final Path JAR = Path.of("target/kafka-connect-turbostats-0.1.0-SNAPSHOT.jar");
+    static final Path JAR = builtJar();
 
     // Prints each post as one JSON line. It shares the worker's network
     // namespace, so the worker reports to the loopback, the only place the
@@ -158,6 +158,16 @@ class WorkerReleaseIT {
         if (network != null) {
             network.close();
         }
+    }
+
+    // Failsafe passes the jar this build packaged. A fixed name breaks once
+    // the release workflow sets the version from the tag.
+    static Path builtJar() {
+        String jar = System.getProperty("release.jar");
+        if (jar == null) {
+            throw new IllegalStateException("release.jar is unset: run scripts/mvn verify -Prelease");
+        }
+        return Path.of(jar);
     }
 
     static void exec(GenericContainer<?> c, String... cmd) {

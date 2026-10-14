@@ -4,27 +4,57 @@ Reports every Kafka Connect connector task to TurboStats: whether it is running,
 
 ## Requirements
 
+Check the worker before you install:
+
 - **Java 17 or later on the worker.** Debezium 3 already requires it. On Java 11 the worker fails to start, with `UnsupportedClassVersionError` naming this jar.
-- **Kafka Connect 2.3 or later**, distributed or standalone.
+- **Kafka Connect 2.5 or later**, distributed or standalone. Sink lag asks the broker through `Admin.listOffsets` and `OffsetSpec`, which arrived in 2.5.
 
-## Install it on the worker's classpath
+## Install
 
-**Put the jar in the worker's classpath, not its plugin path.** In the Debezium image that is `/kafka/libs`. Connect builds each task's producer and consumer with the connector's own classloader, which cannot see another plugin: from the plugin path, every source task on the worker fails with `Failed to construct kafka producer`.
+Install takes six steps, from no key to the first report:
 
-Then add to the worker's properties:
+1. **Create a key.** In TurboStats Control at https://control.turbolytics.io, open your org's Keys page and create a key. The page shows the `sfc_` credential once. Copy it then.
+2. **Download the jar** from https://github.com/turbolytics/kafka-connect-turbostats/releases/latest.
+3. **Put the jar on the worker's classpath, not its plugin path.** In the Debezium image that is `/kafka/libs`; [Platforms](#platforms) names the others. Connect builds each task's producer and consumer with the connector's own classloader, which cannot see another plugin: from the plugin path, every source task on the worker fails with `Failed to construct kafka producer`.
+4. **Add to the worker's properties:**
 
-```properties
-rest.extension.classes=io.turbolytics.turbostats.connect.TurboStatsExtension
-producer.interceptor.classes=io.turbolytics.turbostats.connect.intercept.AckInterceptor
-consumer.interceptor.classes=io.turbolytics.turbostats.connect.intercept.ConsumeInterceptor
+   ```properties
+   rest.extension.classes=io.turbolytics.turbostats.connect.TurboStatsExtension
+   producer.interceptor.classes=io.turbolytics.turbostats.connect.intercept.AckInterceptor
+   consumer.interceptor.classes=io.turbolytics.turbostats.connect.intercept.ConsumeInterceptor
 
-turbostats.report.to=https://ingest.turbolytics.io/v1/turbostats
-turbostats.key=${env:TURBOSTATS_KEY}
-config.providers=env
-config.providers.env.class=org.apache.kafka.common.config.provider.EnvVarConfigProvider
-```
+   turbostats.report.to=https://ingest.turbolytics.io/v1/turbostats
+   turbostats.key=${env:TURBOSTATS_KEY}
+   config.providers=env
+   config.providers.env.class=org.apache.kafka.common.config.provider.EnvVarConfigProvider
+   ```
 
-If the worker already sets interceptor classes, add these to its list, comma-separated.
+   If the worker already sets `rest.extension.classes` or interceptor classes, add these to its list, comma-separated.
+5. **Set `TURBOSTATS_KEY`** in the worker's environment to the credential from step 1.
+6. **Restart the worker** and look for this line in its log:
+
+   ```
+   turbostats: reporting every 60s to https://ingest.turbolytics.io/v1/turbostats as Credential(<key id>) for cluster <cluster>
+   ```
+
+   The key id matches the one Control shows for the key. If the line says reporting is off, the `turbostats:` lines above it say why.
+
+   The worker checks the key pair before it reports. A FIPS-mode or non-OpenJDK crypto provider can derive a different public key from the credential. The worker then logs `turbostats.key: the JVM's crypto provider <provider> derived a different key from the credential`, and reporting stays off.
+
+## Platforms
+
+**Debezium image.** Put the jar in `/kafka/libs`. Set worker properties as `CONNECT_*` variables, such as `CONNECT_TURBOSTATS_REPORT_TO`. Removing a `CONNECT_TURBOSTATS_*` variable does not remove the setting. The image appends each variable to the worker's properties file in the `/kafka/config` volume, and the volume survives a container recreate. Recreate with `docker compose up --force-recreate --renew-anon-volumes`, or edit the file.
+
+**Confluent `cp-kafka-connect`.** Put the jar in `/usr/share/java/kafka`, which the image puts on the classpath. Set worker properties as `CONNECT_*` variables: `CONNECT_REST_EXTENSION_CLASSES`, `CONNECT_PRODUCER_INTERCEPTOR_CLASSES`, `CONNECT_TURBOSTATS_KEY` and so on. Confluent RBAC sets its own REST extension, and Confluent Monitoring Interceptors set interceptor classes. Comma-join ours with theirs.
+
+**Strimzi.** Build a custom image with the jar in `/opt/kafka/libs`. `spec.build` puts jars on the plugin path, which does not work. Put the worker properties in `spec.config`, and `TURBOSTATS_KEY` in `spec.template.connectContainer.env` from a Secret. In the `KafkaConnect` spec, Strimzi allows `rest.extension.classes` but forbids `producer.interceptor.classes` and `consumer.interceptor.classes`. Without the interceptors, the reporter still reports each task's state, records and lag from Connect's metrics. It loses restarts, source event lag and snapshot progress. To keep them, set the interceptors per connector in each `KafkaConnector`:
+
+- `producer.override.interceptor.classes=io.turbolytics.turbostats.connect.intercept.AckInterceptor` on a source.
+- `consumer.override.interceptor.classes=io.turbolytics.turbostats.connect.intercept.ConsumeInterceptor` on a sink.
+
+Overrides need `connector.client.config.override.policy=All` on the worker, the default since Kafka 3.0.
+
+**MSK Connect.** Not supported. It offers no worker classpath and restricts worker properties.
 
 ## Settings
 
@@ -39,12 +69,6 @@ If the worker already sets interceptor classes, add these to its list, comma-sep
 
 A bad setting turns reporting off and logs why. It never stops the worker or a connector.
 
-In the Debezium image, removing a `CONNECT_TURBOSTATS_*` variable does not remove the setting. The image appends each variable to the worker's properties file in the `/kafka/config` volume, and the volume survives a container recreate. Recreate with `docker compose up --force-recreate --renew-anon-volumes`, or edit the file.
-
-At startup the worker logs `reporting every 60s to … as Credential(<key id>)`. The key id matches the one your dashboard shows for the key.
-
-The worker checks the key pair before it reports. A FIPS-mode or non-OpenJDK crypto provider can derive a different public key from the credential. The worker then logs `turbostats.key: the JVM's crypto provider <provider> derived a different key from the credential`, and reporting stays off.
-
 ## What a report carries
 
 One report per task, under the id `<cluster>/<connector>/<task>`:
@@ -58,9 +82,16 @@ One report per task, under the id `<cluster>/<connector>/<task>`:
 - For a sink, its lag in messages, asked of the broker for the partitions the task holds. The reporter connects with the worker's own `bootstrap.servers`, `security.protocol`, `sasl.*` and `ssl.*` settings, and `admin.*` overrides, and needs permission to describe the sink's consumer group.
 - Bytes the task's Kafka client sent or fetched.
 - The worker's uptime, memory, garbage collections and container limit.
+- The worker's `host:port`, as Connect names the worker.
 - The connector's type and a hash of its config, keyed by your credential. The config itself never leaves the worker: it holds your database password. The keyed hash means nothing outside your install, and cannot be checked against a guessed password.
 
 When a connector is deleted or stopped, or `tasks.max` is lowered, each task that ends sends a final report saying so. A task that moves to another worker continues under the same id.
+
+Kafka logs each `turbostats.*` setting as unused, because Connect hands the worker's properties to its own Kafka clients. The line names the setting, never its value:
+
+- Before Kafka 3.3: `The configuration 'turbostats.key' was supplied but isn't a known config.`, at WARN, once per setting.
+- Kafka 3.3 and 3.4: `These configurations '[turbostats.key, …]' were supplied but are not used yet.`, at WARN.
+- Kafka 3.5 and later: the same line, at INFO.
 
 ## Testing
 
