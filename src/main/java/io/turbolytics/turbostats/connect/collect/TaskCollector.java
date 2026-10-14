@@ -116,9 +116,6 @@ public final class TaskCollector {
             if (!local.contains(gone)) {
                 pending.put(gone, new Pending(last.remove(gone), 0));
                 seen.remove(gone);
-                // A task that comes back here starts counting afresh: its
-                // return is not a restart.
-                TaskCounters.forget(gone);
             }
         }
         for (Map.Entry<TaskKey, Pending> e : new ArrayList<>(pending.entrySet())) {
@@ -126,8 +123,16 @@ public final class TaskCollector {
             if (d.exit() != null) {
                 out.add(e.getValue().last().withExit(d.exit(), now));
                 pending.remove(e.getKey());
+                TaskCounters.forget(e.getKey());
             } else if (d.settled() || e.getValue().ticks() + 1 >= EXIT_PATIENCE) {
                 pending.remove(e.getKey());
+                // Forgotten only once its absence is settled. A restarting
+                // task builds its new producer before its metrics return, so
+                // forgetting on the first absent tick could drop the new
+                // incarnation's counters or its start. A task that comes back
+                // after this starts counting afresh: its return is not a
+                // restart.
+                TaskCounters.forget(e.getKey());
             } else {
                 pending.put(e.getKey(), new Pending(e.getValue().last(), e.getValue().ticks() + 1));
             }
