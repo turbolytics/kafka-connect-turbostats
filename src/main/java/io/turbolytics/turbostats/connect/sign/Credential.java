@@ -1,12 +1,15 @@
 package io.turbolytics.turbostats.connect.sign;
 
+import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
+import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.MessageDigest;
 import java.security.PrivateKey;
 import java.security.SecureRandom;
 import java.security.Signature;
+import java.security.spec.EdECPrivateKeySpec;
 import java.security.spec.NamedParameterSpec;
 import java.util.Arrays;
 import java.util.Base64;
@@ -20,6 +23,7 @@ public final class Credential {
     public static final String PREFIX = "sfc_";
     private static final String PUBLIC_PREFIX = "sfp_";
     private static final int SEED_SIZE = 32;
+    private static final byte[] CHECK_MESSAGE = "turbostats key check".getBytes(StandardCharsets.UTF_8);
 
     private final PrivateKey privateKey;
     private final byte[] publicKey;
@@ -53,15 +57,43 @@ public final class Credential {
         if (seed.length != SEED_SIZE) {
             throw new IllegalArgumentException("a credential's seed is " + seed.length + " bytes, not 32");
         }
+        KeyPair generated;
         try {
             KeyPairGenerator g = KeyPairGenerator.getInstance("Ed25519");
             g.initialize(NamedParameterSpec.ED25519, new SeedRandom(seed));
-            KeyPair kp = g.generateKeyPair();
-            byte[] encoded = kp.getPublic().getEncoded();
+            generated = g.generateKeyPair();
+        } catch (GeneralSecurityException e) {
+            throw new IllegalArgumentException("this JVM cannot make Ed25519 keys: " + e.getClass().getSimpleName());
+        }
+        return fromSeed(seed, generated);
+    }
+
+    /**
+     * Signs with a private key built from the seed itself, which every
+     * provider must honour. Only the public key comes from the generator,
+     * and a provider's generator may draw other bytes than the seed, so the
+     * pair must sign and verify before it is used. A pair that does not
+     * would get every report refused.
+     */
+    static Credential fromSeed(byte[] seed, KeyPair generated) {
+        try {
+            PrivateKey privateKey = KeyFactory.getInstance("Ed25519")
+                    .generatePrivate(new EdECPrivateKeySpec(NamedParameterSpec.ED25519, seed));
+            Signature s = Signature.getInstance("Ed25519");
+            s.initSign(privateKey);
+            s.update(CHECK_MESSAGE);
+            byte[] sig = s.sign();
+            s.initVerify(generated.getPublic());
+            s.update(CHECK_MESSAGE);
+            if (!s.verify(sig)) {
+                throw new IllegalArgumentException("the JVM's crypto provider " + s.getProvider().getName()
+                        + " derived a different key from the credential; reports signed with it would be refused");
+            }
+            byte[] encoded = generated.getPublic().getEncoded();
             // An Ed25519 X.509 encoding is a fixed 12-byte prefix and the
             // 32-byte raw key.
             byte[] raw = Arrays.copyOfRange(encoded, encoded.length - 32, encoded.length);
-            return new Credential(kp.getPrivate(), raw, configHashKeyOf(seed));
+            return new Credential(privateKey, raw, configHashKeyOf(seed));
         } catch (GeneralSecurityException e) {
             throw new IllegalArgumentException("this JVM cannot make Ed25519 keys: " + e.getClass().getSimpleName());
         }
@@ -105,7 +137,7 @@ public final class Credential {
     private static byte[] configHashKeyOf(byte[] seed) {
         try {
             MessageDigest d = MessageDigest.getInstance("SHA-256");
-            d.update("turbostats config hash v1".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            d.update("turbostats config hash v1".getBytes(StandardCharsets.UTF_8));
             d.update(seed);
             return d.digest();
         } catch (GeneralSecurityException e) {
@@ -125,8 +157,9 @@ public final class Credential {
 
     /**
      * Hands the key generator the seed instead of random bytes. The JDK has
-     * no API that derives an Ed25519 public key from a seed; the generator
-     * draws exactly the 32 private-key bytes from its random source.
+     * no API that derives an Ed25519 public key from a seed. OpenJDK's
+     * generator draws exactly the 32 private-key bytes from its random
+     * source; fromSeed catches a provider that does not.
      */
     private static final class SeedRandom extends SecureRandom {
         private static final long serialVersionUID = 1L;
