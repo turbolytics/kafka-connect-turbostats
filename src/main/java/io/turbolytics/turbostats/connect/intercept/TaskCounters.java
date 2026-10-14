@@ -25,6 +25,7 @@ public final class TaskCounters {
     private final AtomicLong consumerStarts = new AtomicLong();
     private final AtomicLong sent = new AtomicLong();
     private final AtomicLong acked = new AtomicLong();
+    private final AtomicLong payloadBytes = new AtomicLong();
     private volatile long lastProducerStartMillis;
     private volatile long lastConsumerStartMillis;
     private volatile long lastAckMillis;
@@ -50,7 +51,8 @@ public final class TaskCounters {
             long eventLagMillis,
             long maxEventLagMillis,
             long eventObservedMillis,
-            String timestampBasis) {
+            String timestampBasis,
+            long payloadBytes) {
     }
 
     public static TaskCounters of(TaskKey k) {
@@ -93,6 +95,7 @@ public final class TaskCounters {
         maxEventLagMillis = -1;
         eventObservedMillis = 0;
         timestampBasis = null;
+        payloadBytes.set(0);
         lastConsumerStartMillis = nowMillis;
         consumerStarts.incrementAndGet();
     }
@@ -110,6 +113,10 @@ public final class TaskCounters {
         lastBatchMillis = nowMillis;
     }
 
+    void payload(long bytes) {
+        payloadBytes.addAndGet(bytes);
+    }
+
     void event(long lagMillis, long nowMillis, String basis) {
         eventLagMillis = lagMillis;
         maxEventLagMillis = Math.max(maxEventLagMillis, lagMillis);
@@ -120,6 +127,6 @@ public final class TaskCounters {
     public Snapshot snapshot() {
         return new Snapshot(producerStarts.get(), lastProducerStartMillis, consumerStarts.get(),
                 lastConsumerStartMillis, sent.get(), acked.get(), lastAckMillis, lastBatchMillis, eventLagMillis,
-                maxEventLagMillis, eventObservedMillis, timestampBasis);
+                maxEventLagMillis, eventObservedMillis, timestampBasis, payloadBytes.get());
     }
 }

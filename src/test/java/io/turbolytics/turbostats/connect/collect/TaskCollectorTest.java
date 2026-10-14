@@ -474,6 +474,100 @@ class TaskCollectorTest {
         }
     }
 
+    // A failed task says what failed: the root exception's class, never its
+    // message, dated when this reporter first saw the failure.
+    @Test
+    void aFailedTaskReportsItsErrorCodeAndNotItsMessage() throws Exception {
+        runningSource(5, 5, 0);
+        TaskCollector c = collector();
+        assertNull(c.collect(NOW).get(0).pipeline().lastErrorCode());
+
+        cluster.tasks.put(SRC, new TaskHealth("FAILED", "10.0.3.7:8083", "source", ErrorCodeTest.TRACE));
+        Bundle b = c.collect(NOW.plusSeconds(60)).get(0);
+        assertEquals("org.postgresql.util.PSQLException", b.pipeline().lastErrorCode());
+        assertEquals(NOW.plusSeconds(60), b.pipeline().lastErrorAt());
+        String json = b.toJson().toString();
+        assertTrue(json.contains("\"last_error_code\":\"org.postgresql.util.PSQLException\""), json);
+        assertTrue(!json.contains("ana@example.com") && !json.contains("duplicate key"), json);
+
+        // Still failed a tick later: the same failure, not a new one.
+        assertEquals(NOW.plusSeconds(60), c.collect(NOW.plusSeconds(120)).get(0).pipeline().lastErrorAt());
+
+        cluster.tasks.put(SRC, new TaskHealth("RUNNING", "10.0.3.7:8083", "source"));
+        assertNull(c.collect(NOW.plusSeconds(180)).get(0).pipeline().lastErrorCode());
+    }
+
+    // Connect's last error dates the failure when it fell since the previous
+    // tick. An older one can belong to a tolerated record, so it does not.
+    @Test
+    void aFailureIsDatedByConnectsErrorOnlyWhenItIsNew() {
+        for (long errorAgo : new long[] {30, 600}) {
+            TaskCounters.clear();
+            runningSource(5, 5, 0);
+            jmx.put("kafka.connect:type=task-error-metrics,connector=inventory-cdc,task=0", "last-error-timestamp",
+                    (double) NOW.plusSeconds(60 - errorAgo).toEpochMilli());
+            TaskCollector c = collector();
+            c.collect(NOW);
+            cluster.tasks.put(SRC, new TaskHealth("FAILED", "10.0.3.7:8083", "source", ErrorCodeTest.TRACE));
+            Instant want = errorAgo < 60 ? NOW.plusSeconds(60 - errorAgo) : NOW.plusSeconds(60);
+            assertEquals(want, c.collect(NOW.plusSeconds(60)).get(0).pipeline().lastErrorAt(), "ago " + errorAgo);
+        }
+    }
+
+    // A transform that drops records finishes them without handing them to
+    // the connector. Written never exceeds what the connector was handed.
+    @Test
+    void aSinkNeverWritesMoreThanItWasHanded() {
+        jmx.put(SNK_TASK, "status", "running")
+                .put(SNK_METRICS, "sink-record-read-total", 100.0)
+                .put(SNK_METRICS, "sink-record-send-total", 50.0)
+                .put(SNK_METRICS, "sink-record-active-count", 0.0);
+        cluster.tasks.put(SNK, new TaskHealth("RUNNING", "10.0.3.8:8083", "sink"));
+        cluster.connectorStates.put("customers-sink", "RUNNING");
+        Bundle b = collector().collect(NOW).get(0);
+        assertEquals(50, b.pipeline().sinkRowsAccepted());
+        assertEquals(50, b.pipeline().sinkRowsWritten());
+    }
+
+    // A sink's payload bytes are the values its consumer received, the same
+    // records message_count counts. A tombstone carries none. A source has
+    // no such count, and a sink without the interceptor reports none.
+    @Test
+    void aSinkReportsThePayloadBytesItRead() {
+        org.apache.kafka.common.TopicPartition tp = new org.apache.kafka.common.TopicPartition("c", 0);
+        io.turbolytics.turbostats.connect.intercept.ConsumeInterceptor in =
+                new io.turbolytics.turbostats.connect.intercept.ConsumeInterceptor();
+        in.configure(Map.of("client.id", "connector-consumer-customers-sink-0"));
+        in.onConsume(new org.apache.kafka.clients.consumer.ConsumerRecords<>(Map.of(tp, List.of(
+                record(tp, 0, 120), record(tp, 1, 80), record(tp, 2, -1)))));
+        jmx.put(SNK_TASK, "status", "running")
+                .put(SNK_METRICS, "sink-record-read-total", 3.0)
+                .put(SNK_METRICS, "sink-record-send-total", 3.0);
+        cluster.tasks.put(SNK, new TaskHealth("RUNNING", "10.0.3.8:8083", "sink"));
+        cluster.connectorStates.put("customers-sink", "RUNNING");
+        runningSource(5, 5, 0);
+
+        TaskCollector c = collector();
+        Map<String, Bundle> byId = new HashMap<>();
+        for (Bundle b : c.collect(NOW)) {
+            byId.put(b.instance().id(), b);
+        }
+        assertEquals(200L, byId.get("prod-connect/customers-sink/0").pipeline().messagePayloadBytes());
+        assertNull(byId.get("prod-connect/inventory-cdc/0").pipeline().messagePayloadBytes());
+
+        TaskCounters.clear();
+        assertNull(collector().collect(NOW).stream().filter(b -> b.instance().id().endsWith("customers-sink/0"))
+                .findFirst().orElseThrow().pipeline().messagePayloadBytes());
+    }
+
+    static org.apache.kafka.clients.consumer.ConsumerRecord<Object, Object> record(
+            org.apache.kafka.common.TopicPartition tp, long offset, int valueSize) {
+        return new org.apache.kafka.clients.consumer.ConsumerRecord<>(tp.topic(), tp.partition(), offset,
+                NOW.toEpochMilli(), org.apache.kafka.common.record.TimestampType.CREATE_TIME, 4, valueSize,
+                "k", valueSize < 0 ? null : "v", new org.apache.kafka.common.header.internals.RecordHeaders(),
+                Optional.empty());
+    }
+
     // Under exactly-once, Connect builds a consumer for every source task
     // with the task's consumer client id. It is not a second start.
     @Test

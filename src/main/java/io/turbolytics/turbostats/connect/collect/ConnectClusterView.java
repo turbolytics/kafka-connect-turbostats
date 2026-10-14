@@ -29,7 +29,7 @@ public final class ConnectClusterView implements ClusterView {
                 return Optional.empty();
             }
             String type = h.type() == null ? "unknown" : h.type().toString().toLowerCase(Locale.ROOT);
-            return Optional.of(new TaskHealth(t.state(), t.workerId(), type));
+            return Optional.of(new TaskHealth(t.state(), t.workerId(), type, t.traceMessage()));
         } catch (Throwable e) {
             return Optional.empty();
         }

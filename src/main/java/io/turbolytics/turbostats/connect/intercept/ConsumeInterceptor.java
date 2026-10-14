@@ -40,12 +40,16 @@ public final class ConsumeInterceptor implements ConsumerInterceptor<Object, Obj
                 c.batch(now);
                 long newest = -1;
                 TimestampType type = TimestampType.NO_TIMESTAMP_TYPE;
+                long bytes = 0;
                 for (ConsumerRecord<Object, Object> r : records) {
+                    // -1 for a null value, a tombstone: it carries no payload.
+                    bytes += Math.max(0, r.serializedValueSize());
                     if (r.timestamp() > newest && r.timestampType() != TimestampType.NO_TIMESTAMP_TYPE) {
                         newest = r.timestamp();
                         type = r.timestampType();
                     }
                 }
+                c.payload(bytes);
                 if (newest >= 0) {
                     c.event(Math.max(0, now - newest), now, type == TimestampType.LOG_APPEND_TIME
                             ? "kafka_log_append_time" : "kafka_create_time");
