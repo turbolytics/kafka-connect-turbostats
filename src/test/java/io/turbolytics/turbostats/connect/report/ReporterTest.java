@@ -36,13 +36,16 @@ class ReporterTest {
     }
 
     static class StubSender implements Sender.Port {
-        final List<CompletableFuture<Integer>> calls = new ArrayList<>();
+        final List<CompletableFuture<Sender.Answer>> calls = new ArrayList<>();
         int status = 200;
+        String reason;
+        long retryAfter;
         boolean hang;
 
         @Override
-        public CompletableFuture<Integer> send(Bundle b, Instant now) {
-            CompletableFuture<Integer> f = hang ? new CompletableFuture<>() : CompletableFuture.completedFuture(status);
+        public CompletableFuture<Sender.Answer> send(Bundle b, Instant now) {
+            CompletableFuture<Sender.Answer> f = hang ? new CompletableFuture<>()
+                    : CompletableFuture.completedFuture(new Sender.Answer(status, reason, retryAfter));
             calls.add(f);
             return f;
         }
@@ -65,7 +68,7 @@ class ReporterTest {
         r.tick();
         r.tick();
         assertEquals(1, s.calls.size());
-        s.calls.get(0).complete(200);
+        s.calls.get(0).complete(Sender.Answer.of(200));
         r.tick();
         assertEquals(2, s.calls.size());
     }
@@ -127,8 +130,8 @@ class ReporterTest {
             int n;
 
             @Override
-            public CompletableFuture<Integer> send(Bundle b, Instant now) {
-                return CompletableFuture.completedFuture(n++ % 2 == 0 ? 200 : 429);
+            public CompletableFuture<Sender.Answer> send(Bundle b, Instant now) {
+                return CompletableFuture.completedFuture(Sender.Answer.of(n++ % 2 == 0 ? 200 : 429));
             }
         };
         Reporter r = new Reporter(() -> List.of(Fixtures.sourceBundle(), Fixtures.sinkBundle()), mixed, log, CLOCK);
@@ -150,5 +153,117 @@ class ReporterTest {
         r.tick();
         r.tick();
         assertEquals(1, log.warns.size());
+    }
+
+    /** The sink fixture under its own id: the two fixtures share one. */
+    static Bundle sink() {
+        Bundle b = Fixtures.sinkBundle();
+        io.turbolytics.turbostats.connect.wire.Instance i = b.instance();
+        return new Bundle(b.sentAt(), b.intervalSeconds(), b.lastActivityAt(),
+                new io.turbolytics.turbostats.connect.wire.Instance("prod-connect/customers-sink/0",
+                        "prod-connect/customers-sink", i.version(), i.commit(), i.arch(), i.configHash(),
+                        i.sourceType(), i.sinkType(), i.runtime(), i.runtimeVersion(), i.reporterVersion(),
+                        i.labels()),
+                b.process(), b.pipeline(), b.exit());
+    }
+
+    // A refusal says why, in the receiver's words: a 401 alone cannot tell
+    // a revoked key from a skewed clock.
+    @Test
+    void aRefusalCarriesTheReceiversReason() {
+        StubSender s = new StubSender();
+        s.status = 401;
+        s.reason = "timestamp is 7m from this clock";
+        RecordingLog log = new RecordingLog();
+        new Reporter(() -> List.of(Fixtures.sourceBundle()), s, log, CLOCK).tick();
+        assertTrue(log.warns.get(0).contains("401: timestamp is 7m from this clock"), log.warns.get(0));
+        assertTrue(log.warns.get(0).contains("turbostats.key"), log.warns.get(0));
+    }
+
+    // A worker with many tasks and a bad key meets the receiver's limit
+    // after its first refusals. The warning names the key, not the rate.
+    @Test
+    void aRefusedKeyOutranksARateLimit() {
+        RecordingLog log = new RecordingLog();
+        Sender.Port mixed = (b, now) -> CompletableFuture.completedFuture(
+                b.instance().id().equals(sink().instance().id())
+                        ? new Sender.Answer(401, "no such key", 0)
+                        : new Sender.Answer(429, "too many requests", 30));
+        new Reporter(() -> List.of(Fixtures.sourceBundle(), sink()), mixed, log, CLOCK).tick();
+        assertTrue(log.warns.get(0).contains("401: no such key"), log.warns.get(0));
+    }
+
+    // A 429's Retry-After holds that instance back until it passes, and
+    // only that instance. An exit is never held back: it is sent once.
+    @Test
+    void aRetryAfterHoldsBackOnlyItsInstance() {
+        java.util.concurrent.atomic.AtomicReference<Instant> now =
+                new java.util.concurrent.atomic.AtomicReference<>(CLOCK.instant());
+        java.time.Clock clock = new java.time.Clock() {
+            public java.time.ZoneId getZone() {
+                return java.time.ZoneOffset.UTC;
+            }
+
+            public java.time.Clock withZone(java.time.ZoneId z) {
+                return this;
+            }
+
+            public Instant instant() {
+                return now.get();
+            }
+        };
+        List<String> sent = new ArrayList<>();
+        String source = Fixtures.sourceBundle().instance().id();
+        Sender.Port port = (b, at) -> {
+            sent.add(b.instance().id() + (b.exit() == null ? "" : " exit"));
+            return CompletableFuture.completedFuture(b.instance().id().equals(source) && b.exit() == null
+                    ? new Sender.Answer(429, null, 120) : Sender.Answer.of(200));
+        };
+        List<Bundle> bundles = new ArrayList<>(List.of(Fixtures.sourceBundle(), sink()));
+        Reporter r = new Reporter(() -> bundles, port, new RecordingLog(), clock);
+        r.tick();
+        now.set(now.get().plusSeconds(60));
+        r.tick();
+        String sink = sink().instance().id();
+        assertEquals(List.of(source, sink, sink), sent);
+
+        bundles.set(0, Fixtures.sourceBundle().withExit(
+                new io.turbolytics.turbostats.connect.wire.Exit("connector_deleted", 0), now.get()));
+        r.tick();
+        assertEquals(source + " exit", sent.get(3));
+
+        bundles.set(0, Fixtures.sourceBundle());
+        now.set(now.get().plusSeconds(61));
+        r.tick();
+        assertTrue(sent.subList(5, sent.size()).contains(source), sent.toString());
+    }
+
+    // A transport failure names its root cause and its message.
+    @Test
+    void aTransportFailureNamesItsCause() {
+        Exception tls = new javax.net.ssl.SSLHandshakeException("handshake failed");
+        tls.initCause(new IllegalStateException("PKIX path building failed"));
+        assertEquals("SSLHandshakeException: IllegalStateException: PKIX path building failed",
+                Reporter.cause(new java.util.concurrent.CompletionException(tls)));
+        assertEquals("no answer within turbostats.timeout.seconds",
+                Reporter.cause(new java.util.concurrent.CompletionException(new java.util.concurrent.TimeoutException())));
+    }
+
+    // A sender that throws costs only its own bundle.
+    @Test
+    void aSenderThatThrowsCostsOnlyItsBundle() {
+        List<String> sent = new ArrayList<>();
+        String source = Fixtures.sourceBundle().instance().id();
+        Sender.Port port = (b, at) -> {
+            if (b.instance().id().equals(source)) {
+                throw new IllegalStateException("boom");
+            }
+            sent.add(b.instance().id());
+            return CompletableFuture.completedFuture(Sender.Answer.of(200));
+        };
+        RecordingLog log = new RecordingLog();
+        new Reporter(() -> List.of(Fixtures.sourceBundle(), sink()), port, log, CLOCK).tick();
+        assertEquals(List.of(sink().instance().id()), sent);
+        assertTrue(log.warns.get(0).contains("IllegalStateException: boom"), log.warns.get(0));
     }
 }

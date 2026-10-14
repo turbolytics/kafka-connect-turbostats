@@ -199,4 +199,22 @@ class BrokerLagTest {
         assertTrue(Thread.interrupted());
         assertEquals(1, built[0]);
     }
+
+    // A worker older than Kafka 2.5 has no Admin.listOffsets. Sink lag goes
+    // off with one warning; it never throws into the collector, which
+    // stopped every report while a sink ran.
+    @Test
+    void aWorkerWithoutTheAdminApiTurnsLagOffOnce() {
+        java.util.List<String> warned = new java.util.ArrayList<>();
+        java.util.concurrent.atomic.AtomicInteger built = new java.util.concurrent.atomic.AtomicInteger();
+        BrokerLag lag = new BrokerLag(() -> {
+            built.incrementAndGet();
+            throw new NoSuchMethodError("org.apache.kafka.clients.admin.Admin.listOffsets");
+        }, Duration.ofSeconds(1), warned::add);
+        assertTrue(lag.lags(Map.of("s", "connect-s"), NOW).isEmpty());
+        assertTrue(lag.lags(Map.of("s", "connect-s"), NOW).isEmpty());
+        assertEquals(1, built.get());
+        assertEquals(1, warned.size());
+        assertTrue(warned.get(0).contains("Kafka 2.5"), warned.get(0));
+    }
 }

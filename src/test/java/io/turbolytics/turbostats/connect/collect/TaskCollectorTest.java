@@ -568,6 +568,35 @@ class TaskCollectorTest {
                 Optional.empty());
     }
 
+    // Without the interceptors, as on Strimzi, a task loses its restarts,
+    // acknowledged writes and event lag, and nothing else says so. After
+    // UNCOUNTED_TICKS reports the worker is told once.
+    @Test
+    void aWorkerWithoutInterceptorsIsToldOnce() {
+        runningSource(5, 5, 0);
+        TaskCollector c = collector();
+        for (int i = 0; i < TaskCollector.UNCOUNTED_TICKS - 1; i++) {
+            c.collect(NOW.plusSeconds(60L * i));
+        }
+        assertTrue(warnings.stream().noneMatch(w -> w.contains("interceptor")), warnings.toString());
+        for (int i = TaskCollector.UNCOUNTED_TICKS - 1; i < 10; i++) {
+            c.collect(NOW.plusSeconds(60L * i));
+        }
+        assertEquals(1, warnings.stream().filter(w -> w.contains("interceptor")).count(), warnings.toString());
+        assertTrue(warnings.stream().anyMatch(w -> w.contains("producer.override.")), warnings.toString());
+    }
+
+    @Test
+    void aCountedTaskIsNeverWarned() {
+        new AckInterceptor().configure(Map.of("client.id", "connector-producer-inventory-cdc-0"));
+        runningSource(5, 5, 0);
+        TaskCollector c = collector();
+        for (int i = 0; i < 10; i++) {
+            c.collect(NOW.plusSeconds(60L * i));
+        }
+        assertTrue(warnings.stream().noneMatch(w -> w.contains("interceptor")), warnings.toString());
+    }
+
     // Under exactly-once, Connect builds a consumer for every source task
     // with the task's consumer client id. It is not a second start.
     @Test

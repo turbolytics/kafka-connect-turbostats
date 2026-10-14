@@ -122,4 +122,18 @@ class ReporterConfigTest {
         assertFalse(ReporterConfig.parse(p).enabled());
         assertFalse(ReporterConfig.parse(null).enabled());
     }
+
+    // A worker-wide client.id replaces each task's own, which is how the
+    // reporter finds a task's clients. The worker is told what goes missing.
+    @Test
+    void aWorkerClientIdOverrideIsWarned() {
+        for (String key : java.util.List.of("producer.client.id", "consumer.client.id")) {
+            Map<String, Object> props = valid();
+            props.put(key, "connect-worker");
+            ReporterConfig.Parsed parsed = ReporterConfig.parse(props);
+            assertTrue(parsed.enabled());
+            assertTrue(parsed.warnings().stream().anyMatch(w -> w.contains(key)), parsed.warnings().toString());
+        }
+        assertTrue(ReporterConfig.parse(valid()).warnings().stream().noneMatch(w -> w.contains("client.id")));
+    }
 }
