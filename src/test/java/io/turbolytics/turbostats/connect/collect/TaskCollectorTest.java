@@ -414,6 +414,66 @@ class TaskCollectorTest {
         }
     }
 
+    // A restart on this worker can straddle a tick: the old task's metrics
+    // are gone and the new producer is built before the new metrics register.
+    // The restart counts once the task is back, whichever side of the tick
+    // the new producer lands on.
+    @Test
+    void aRestartThatStraddlesATickIsCounted() {
+        for (boolean producerFirst : new boolean[] {true, false}) {
+            TaskCounters.clear();
+            new AckInterceptor().configure(Map.of("client.id", "connector-producer-inventory-cdc-0"));
+            runningSource(5, 5, 0);
+            TaskCollector c = collector();
+            assertEquals(0L, c.collect(NOW).get(0).pipeline().restartCount());
+
+            jmx.remove(SRC_TASK).remove(SRC_METRICS);
+            cluster.tasks.put(SRC, new TaskHealth("RESTARTING", "10.0.3.7:8083", "source"));
+            AckInterceptor next = new AckInterceptor();
+            if (producerFirst) {
+                next.configure(Map.of("client.id", "connector-producer-inventory-cdc-0"));
+            }
+            assertEquals(List.of(), c.collect(NOW.plusSeconds(60)));
+            if (!producerFirst) {
+                next.configure(Map.of("client.id", "connector-producer-inventory-cdc-0"));
+            }
+            next.onSend(null);
+            next.onAcknowledgement(null, null);
+            runningSource(1, 1, 0);
+
+            Bundle b = c.collect(NOW.plusSeconds(120)).get(0);
+            assertEquals(1L, b.pipeline().restartCount(), "producer first: " + producerFirst);
+            assertEquals(1, b.pipeline().sinkRowsWritten(), "producer first: " + producerFirst);
+        }
+    }
+
+    // A task that moved away and came back starts counting afresh, and so
+    // does one that was gone longer than EXIT_PATIENCE: neither return is a
+    // restart.
+    @Test
+    void aTaskThatReturnsAfterItsAbsenceSettledStartsAfresh() {
+        for (boolean moved : new boolean[] {true, false}) {
+            TaskCounters.clear();
+            new AckInterceptor().configure(Map.of("client.id", "connector-producer-inventory-cdc-0"));
+            runningSource(5, 5, 0);
+            TaskCollector c = collector();
+            c.collect(NOW);
+
+            jmx.remove(SRC_TASK).remove(SRC_METRICS);
+            cluster.tasks.put(SRC, new TaskHealth("RUNNING", moved ? "10.0.3.9:8083" : "10.0.3.7:8083", "source"));
+            int ticks = moved ? 1 : TaskCollector.EXIT_PATIENCE;
+            for (int i = 1; i <= ticks; i++) {
+                c.collect(NOW.plusSeconds(60L * i));
+            }
+            assertTrue(TaskCounters.find(SRC).isEmpty(), "moved: " + moved);
+
+            new AckInterceptor().configure(Map.of("client.id", "connector-producer-inventory-cdc-0"));
+            runningSource(5, 5, 0);
+            assertEquals(0L, c.collect(NOW.plusSeconds(60L * (ticks + 1))).get(0).pipeline().restartCount(),
+                    "moved: " + moved);
+        }
+    }
+
     // Under exactly-once, Connect builds a consumer for every source task
     // with the task's consumer client id. It is not a second start.
     @Test
