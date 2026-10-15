@@ -300,6 +300,7 @@ class WorkerReleaseIT {
         assertTrue(b.at("/pipeline/lag_total_messages").asLong(-1) >= 0);
         assertTrue(b.at("/pipeline/source_wire_bytes").asLong() > 0);
         assertTrue(!b.get("pipeline").has("backfill"));
+        assertTrue(b.at("/pipeline/message_payload_bytes").asLong() > 0);
     }
 
     // The failure this reporter exists for: a failed task on a live worker.
@@ -315,7 +316,14 @@ class WorkerReleaseIT {
                 + "\"transforms.bad.type\":\"org.apache.kafka.connect.transforms.Cast$Value\","
                 + "\"transforms.bad.spec\":\"int8\"}";
         assertEquals(201, rest("PUT", "/connectors/bad-cdc/config", failing));
-        await(b -> is(b, "itest/bad-cdc/0") && b.at("/pipeline/state").asText().equals("failed"));
+        JsonNode post = await(b -> is(b, "itest/bad-cdc/0") && b.at("/pipeline/state").asText().equals("failed"));
+        // The code is the root exception's class, dated; the trace's text,
+        // which can carry a row, stays on the worker.
+        JsonNode b = body(post);
+        assertTrue(b.at("/pipeline/last_error_code").asText().matches("[A-Za-z_$][\\w$]*(\\.[A-Za-z_$][\\w$]*)+"),
+                b.at("/pipeline").toString());
+        assertTrue(b.at("/pipeline/last_error_at").isTextual());
+        assertTrue(!post.get("raw").asText().contains("\\tat "), "the trace left the worker");
     }
 
     // One REST restart is one restart, though Connect re-registers the

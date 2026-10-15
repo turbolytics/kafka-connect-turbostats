@@ -53,6 +53,8 @@ public final class TaskCollector {
     private final Map<TaskKey, Bundle> last = new HashMap<>();
     private final Map<TaskKey, Seen> seen = new HashMap<>();
     private final Map<TaskKey, Pending> pending = new HashMap<>();
+    private final Map<TaskKey, Instant> failedAt = new HashMap<>();
+    private Instant previousTick;
     private final Map<String, ConnectorFacts> facts = new HashMap<>();
     private final Map<String, String> versions = new HashMap<>();
     private final Set<TaskKey> warnedBrokenAcks = new HashSet<>();
@@ -90,6 +92,14 @@ public final class TaskCollector {
 
     public List<Bundle> collect(Instant now) {
         tick++;
+        try {
+            return collectTick(now);
+        } finally {
+            previousTick = now;
+        }
+    }
+
+    private List<Bundle> collectTick(Instant now) {
         List<Bundle> out = new ArrayList<>();
         Set<TaskKey> local = new HashSet<>(metrics.localTasks());
         ProcessInfo jvm = local.isEmpty() ? null : process.get();
@@ -116,6 +126,7 @@ public final class TaskCollector {
             if (!local.contains(gone)) {
                 pending.put(gone, new Pending(last.remove(gone), 0));
                 seen.remove(gone);
+                failedAt.remove(gone);
             }
         }
         for (Map.Entry<TaskKey, Pending> e : new ArrayList<>(pending.entrySet())) {
@@ -217,8 +228,11 @@ public final class TaskCollector {
             // Records read less records in flight is records Connect has
             // finished. Its commit counter is not used: Connect raises it
             // even when it skips a commit because nothing changed, as it does
-            // every flush interval while the destination is down.
-            written = Math.max(0, input.getAsLong() - active);
+            // every flush interval while the destination is down. Finished
+            // includes records a transform dropped, which never reach the
+            // connector, so written is capped at what the connector was
+            // handed: more would claim rows delivered that never existed.
+            written = Math.min(accepted, Math.max(0, input.getAsLong() - active));
             lastWrite = changedAt(prev == null ? null : prev.written(), prev == null ? null : prev.writtenChangedAt(),
                     written, now, earliest);
         } else {
@@ -306,11 +320,31 @@ public final class TaskCollector {
             sinkWireBytes = out.isPresent() ? out.getAsLong() : null;
         }
 
+        // total-record-errors rises once per record that ended in error.
+        // total-record-failures rises on every failed attempt, retries
+        // included (RetryWithToleranceOperator.execAndRetry), so it would
+        // count one record retried ten times as ten errors.
         long errors = metrics.total(ERRORS, k, "total-record-errors").orElse(0);
         OptionalLong lastErrorMillis = metrics.total(ERRORS, k, "last-error-timestamp");
         Instant lastError = lastErrorMillis.isPresent() && lastErrorMillis.getAsLong() > 0
                 ? Instant.ofEpochMilli(lastErrorMillis.getAsLong())
                 : null;
+        String errorCode = null;
+        if ("FAILED".equals(h.state())) {
+            errorCode = ErrorCode.fromTrace(h.trace());
+            // Dated by Connect's last error when it fell since the previous
+            // tick, which is the failure; otherwise by when this reporter
+            // first saw the task failed, at most one interval late. An older
+            // error time can belong to a tolerated record, not the failure.
+            Instant connectError = lastError;
+            Instant at = failedAt.computeIfAbsent(k, x -> connectError != null && previousTick != null
+                    && connectError.isAfter(previousTick) ? connectError : now);
+            if (errorCode != null) {
+                lastError = at;
+            }
+        } else {
+            failedAt.remove(k);
+        }
         OptionalLong skipped = metrics.total(ERRORS, k, "total-records-skipped");
         OptionalLong dlqRequests = metrics.total(ERRORS, k, "deadletterqueue-produce-requests");
         Long dlq = dlqRequests.isPresent()
@@ -349,6 +383,7 @@ public final class TaskCollector {
                 lastMessage,
                 lastWrite,
                 lastError,
+                errorCode,
                 skipped.isPresent() ? skipped.getAsLong() : null,
                 dlq,
                 eventLag,
@@ -356,7 +391,11 @@ public final class TaskCollector {
                 backfill,
                 sourceConnected,
                 sourceWireBytes,
-                sinkWireBytes);
+                sinkWireBytes,
+                // The same records message_count counts, so the two divide to
+                // an average size. A source's poll count is records before
+                // conversion, which have no size yet.
+                sink ? counters.map(TaskCounters.Snapshot::payloadBytes).orElse(null) : null);
 
         return new Bundle(now, config.intervalSeconds(), lastMessage, instance, jvm.withHost(h.workerId()), pipeline,
                 null);
