@@ -27,6 +27,7 @@ public final class BrokerLag {
     private final Consumer<String> warn;
     private final Set<String> warned = new HashSet<>();
     private GroupAdmin admin;
+    private boolean unsupported;
 
     public BrokerLag(Supplier<GroupAdmin> factory, Duration timeout) {
         this(factory, timeout, w -> {
@@ -42,6 +43,9 @@ public final class BrokerLag {
     /** Keyed by task; a connector the broker could not answer for is absent this tick. */
     public Map<TaskKey, MessageLag> lags(Map<String, String> groupByConnector, Instant now) {
         Map<TaskKey, MessageLag> out = new HashMap<>();
+        if (unsupported) {
+            return out;
+        }
         for (Map.Entry<String, String> e : groupByConnector.entrySet()) {
             try {
                 if (admin == null) {
@@ -76,6 +80,15 @@ public final class BrokerLag {
                 // building one per connector would cost every report a
                 // connect and a close each.
                 close();
+                break;
+            } catch (LinkageError ex) {
+                // A worker older than Kafka 2.5 has no Admin.listOffsets.
+                // Thrown past this, it stopped every report while a sink ran.
+                if (!unsupported) {
+                    unsupported = true;
+                    warn.accept("turbostats: this worker's Kafka client has no Admin.listOffsets (Kafka 2.5); "
+                            + "sink lag in messages is off: " + ex.getClass().getSimpleName());
+                }
                 break;
             }
             warned.remove(e.getKey());

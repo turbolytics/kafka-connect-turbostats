@@ -56,9 +56,10 @@ class SenderTest {
         try {
             Credential c = Credential.parse(KEY);
             URI uri = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/v1/turbostats");
-            int status = new Sender(uri, c, Duration.ofSeconds(5))
+            Sender.Answer answer = new Sender(uri, c, Duration.ofSeconds(5))
                     .send(Fixtures.sourceBundle(), Instant.ofEpochSecond(1789848000)).get(10, TimeUnit.SECONDS);
-            assertEquals(200, status);
+            assertEquals(200, answer.status());
+            assertEquals(null, answer.reason());
             assertEquals(Signer.MEDIA_TYPE, got.get("type"));
             assertEquals(c.keyId(), got.get("kid"));
             assertEquals("1789848000", got.get("ts"));
@@ -99,5 +100,66 @@ class SenderTest {
         } finally {
             server.stop(0);
         }
+    }
+
+    // A refusal keeps the receiver's reason as one line, and its
+    // Retry-After. Control writes both with http.Error.
+    @Test
+    void aRefusalKeepsItsReasonAndRetryAfter() throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/turbostats", ex -> {
+            ex.getRequestBody().readAllBytes();
+            byte[] reply = "too many requests\n".getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().set("Retry-After", "27");
+            ex.sendResponseHeaders(429, reply.length);
+            ex.getResponseBody().write(reply);
+            ex.close();
+        });
+        server.start();
+        try {
+            URI uri = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/v1/turbostats");
+            Sender.Answer a = new Sender(uri, Credential.parse(KEY), Duration.ofSeconds(5))
+                    .send(Fixtures.sourceBundle(), Instant.now()).get(10, TimeUnit.SECONDS);
+            assertEquals(new Sender.Answer(429, "too many requests", 27), a);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    // A long body is cut, not read whole: it goes into the worker's log.
+    @Test
+    void aLongRefusalIsCut() throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/turbostats", ex -> {
+            ex.getRequestBody().readAllBytes();
+            byte[] reply = ("<html>\n" + "x".repeat(1_000_000)).getBytes(StandardCharsets.UTF_8);
+            ex.sendResponseHeaders(502, reply.length);
+            try {
+                ex.getResponseBody().write(reply);
+            } catch (java.io.IOException ignored) {
+                // The sender stops reading once it has enough.
+            }
+            ex.close();
+        });
+        server.start();
+        try {
+            URI uri = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/v1/turbostats");
+            Sender.Answer a = new Sender(uri, Credential.parse(KEY), Duration.ofSeconds(5))
+                    .send(Fixtures.sourceBundle(), Instant.now()).get(10, TimeUnit.SECONDS);
+            assertEquals(502, a.status());
+            assertTrue(a.reason().startsWith("<html> xxx"), a.reason());
+            assertEquals(Sender.REASON_CHARS + 1, a.reason().length());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void aReasonIsOneLineOfText() {
+        assertEquals("no such key", Sender.reason("no such key\n"));
+        // Control characters go, so a body cannot move the log's cursor or split its line.
+        assertEquals("a [31mb", Sender.reason("a\r\n\u001b[31mb"));
+        assertEquals(null, Sender.reason(" \n"));
+        assertEquals(null, Sender.reason(null));
     }
 }

@@ -69,6 +69,22 @@ Overrides need `connector.client.config.override.policy=All` on the worker, the 
 
 A bad setting turns reporting off and logs why. It never stops the worker or a connector.
 
+## Troubleshooting
+
+When reporting starts to fail, the worker logs `turbostats reporting is failing: <why>` once. It logs `turbostats reporting recovered` when reports succeed again. The `<why>` names the most actionable cause and Control's own reason:
+
+- `receiver answered 401: Unauthorized; check turbostats.key and the worker's clock`. Control refused the key, or the worker's clock is more than 5 minutes from Control's. Control does not say which, so a stranger cannot probe for keys. Compare the key id in the startup line with the one Control shows, then check the clock.
+- `receiver answered 403: … is at its limit of …`. Control names the limit and the task it refused. A task stops counting when it exits, or five minutes after its last report.
+- `receiver answered 429: …; if reports arrive more often than every 30s, raise turbostats.interval.seconds`. Control sets a `Retry-After`, and the task it refused waits that long, up to an hour. Other tasks keep reporting.
+- `no answer within turbostats.timeout.seconds`. Control did not answer in time.
+- An exception and its root cause, such as `SSLHandshakeException: SunCertPathBuilderException`. The worker could not reach Control. Check the network path and the JVM's trust store.
+
+Other warnings name a setting that costs part of each report:
+
+- `<connector>/<task> has no interceptor counts after 3 reports`. The interceptors are not set, so restarts, acknowledged writes, event lag and snapshot progress go unreported. See step 4 of the install, or the Strimzi note.
+- `the worker sets producer.client.id` (or `consumer.client.id`). That setting replaces each task's own client id, which the reporter finds tasks by. Remove it.
+- `this worker's Kafka client has no Admin.listOffsets (Kafka 2.5)`. Sink lag in messages is off. Everything else reports.
+
 ## What a report carries
 
 One report per task, under the id `<cluster>/<connector>/<task>`:

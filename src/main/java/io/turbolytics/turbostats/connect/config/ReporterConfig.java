@@ -96,6 +96,14 @@ public record ReporterConfig(
             errors.add("turbostats.cluster may not contain / and is at most " + MAX_CLUSTER + " characters");
         }
 
+        for (String client : List.of("producer.client.id", "consumer.client.id")) {
+            if (string(props, client) != null) {
+                warnings.add("the worker sets " + client + ", which replaces each task's own client id; the reporter"
+                        + " finds tasks by that id, so restarts, acknowledged writes, event lag and sink lag go"
+                        + " unreported. Remove " + client + " to keep them");
+            }
+        }
+
         int interval = positiveInt(props, "turbostats.interval.seconds", DEFAULT_INTERVAL_SECONDS, errors);
         int timeout = positiveInt(props, "turbostats.timeout.seconds", DEFAULT_TIMEOUT_SECONDS, errors);
         if (interval > 0 && timeout > 0 && timeout >= interval) {

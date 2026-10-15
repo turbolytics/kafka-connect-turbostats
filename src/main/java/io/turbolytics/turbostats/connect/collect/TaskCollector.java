@@ -60,6 +60,11 @@ public final class TaskCollector {
     private final Set<TaskKey> warnedBrokenAcks = new HashSet<>();
     private final Set<TaskKey> warnedUnreadable = new HashSet<>();
     private final Set<String> warnedSharedPrefix = new HashSet<>();
+    private final Map<TaskKey, Integer> uncounted = new HashMap<>();
+    private boolean warnedUncounted;
+
+    /** Reports in a row without interceptor counts before the worker is told why. */
+    static final int UNCOUNTED_TICKS = 3;
     private Set<String> sharedPrefixes = Set.of();
     private long tick;
 
@@ -127,6 +132,7 @@ public final class TaskCollector {
                 pending.put(gone, new Pending(last.remove(gone), 0));
                 seen.remove(gone);
                 failedAt.remove(gone);
+                uncounted.remove(gone);
             }
         }
         for (Map.Entry<TaskKey, Pending> e : new ArrayList<>(pending.entrySet())) {
@@ -149,6 +155,28 @@ public final class TaskCollector {
             }
         }
         return out;
+    }
+
+    /**
+     * Interceptors that never ran leave a task without restarts, acknowledged
+     * writes, event lag and snapshot progress, and nothing else says so.
+     * Strimzi drops interceptor classes from the worker config, and a
+     * client.id override hides the task from them. Warned once per worker.
+     */
+    private void noteCounters(TaskKey k, boolean counted) {
+        if (counted) {
+            uncounted.remove(k);
+            return;
+        }
+        int n = uncounted.merge(k, 1, Integer::sum);
+        if (n >= UNCOUNTED_TICKS && !warnedUncounted) {
+            warnedUncounted = true;
+            warn.accept("turbostats: " + k.connector() + "/" + k.task() + " has no interceptor counts after " + n
+                    + " reports, so its restarts, acknowledged writes, event lag and snapshot progress go"
+                    + " unreported. Set producer.interceptor.classes and consumer.interceptor.classes on the worker,"
+                    + " or per connector with producer.override. and consumer.override. where the worker forbids"
+                    + " them, as Strimzi does, and leave client.id unset");
+        }
     }
 
     private record Decision(Exit exit, boolean settled) {
@@ -210,6 +238,7 @@ public final class TaskCollector {
         long active = metrics.total(type, k, sink ? "sink-record-active-count" : "source-record-active-count").orElse(0);
         Optional<TaskCounters.Snapshot> counters = TaskCounters.find(k).map(TaskCounters::snapshot)
                 .filter(s -> (sink ? s.consumerStarts() : s.producerStarts()) > 0);
+        noteCounters(k, counters.isPresent());
         Seen prev = seen.get(k);
         long starts = counters.map(c -> sink ? c.consumerStarts() : c.producerStarts()).orElse(0L);
         long startMillis = counters.map(c -> sink ? c.lastConsumerStartMillis() : c.lastProducerStartMillis()).orElse(0L);
@@ -424,7 +453,15 @@ public final class TaskCollector {
                 // The task's own bundle reports what it can without lag.
             }
         }
-        return groups.isEmpty() ? Map.of() : brokerLag.lags(groups, now);
+        if (groups.isEmpty()) {
+            return Map.of();
+        }
+        try {
+            return brokerLag.lags(groups, now);
+        } catch (Throwable e) {
+            // Lag is one field; a failure here must not cost every report.
+            return Map.of();
+        }
     }
 
     /**
