@@ -41,7 +41,9 @@ A bad setting turns reporting off and logs why. It never stops the worker or a c
 
 In the Debezium image, removing a `CONNECT_TURBOSTATS_*` variable does not remove the setting. The image appends each variable to the worker's properties file in the `/kafka/config` volume, and the volume survives a container recreate. Recreate with `docker compose up --force-recreate --renew-anon-volumes`, or edit the file.
 
-At startup the worker logs `reporting every 60s to … as Credential(<key id>)`. If that key id does not match the one your dashboard shows for the key, the JVM's crypto provider derived a different key from the credential; FIPS-mode and non-OpenJDK providers can.
+At startup the worker logs `reporting every 60s to … as Credential(<key id>)`. The key id matches the one your dashboard shows for the key.
+
+The worker checks the key pair before it reports. A FIPS-mode or non-OpenJDK crypto provider can derive a different public key from the credential. The worker then logs `turbostats.key: the JVM's crypto provider <provider> derived a different key from the credential`, and reporting stays off.
 
 ## What a report carries
 

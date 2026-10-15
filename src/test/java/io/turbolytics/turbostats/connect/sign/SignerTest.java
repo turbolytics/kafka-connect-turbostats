@@ -9,6 +9,12 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.security.KeyFactory;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.PublicKey;
+import java.security.Signature;
+import java.security.spec.X509EncodedKeySpec;
 import java.util.Base64;
 import java.util.HexFormat;
 import java.util.Map;
@@ -73,5 +79,45 @@ class SignerTest {
         assertEquals(HexFormat.of().formatHex(k1), HexFormat.of().formatHex(k2));
         assertFalse(HexFormat.of().formatHex(k1).equals(vectors().get("seed_hex").asText()));
         assertEquals(32, k1.length);
+    }
+
+    // A provider whose generator draws other bytes than the seed derives a
+    // different pair. Loading it would get every report refused, so it
+    // fails to load, names the provider, and never echoes the seed.
+    @Test
+    void aPairThatDoesNotVerifyRefusesToLoad() throws Exception {
+        JsonNode v = vectors();
+        byte[] seed = HexFormat.of().parseHex(v.get("seed_hex").asText());
+        KeyPair other = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> Credential.fromSeed(seed, other));
+        assertTrue(e.getMessage().contains("derived a different key"), e.getMessage());
+        assertTrue(e.getMessage().contains(Signature.getInstance("Ed25519").getProvider().getName()), e.getMessage());
+        assertFalse(e.getMessage().contains(v.get("seed_hex").asText()));
+        assertFalse(e.getMessage().contains(v.get("credential").asText().substring(Credential.PREFIX.length())));
+    }
+
+    // The signing key comes from the seed, not from the generator's pair.
+    // The generator here returns the right public key beside a wrong
+    // private key, and the signature still matches the Go reference.
+    @Test
+    void theSigningKeyComesFromTheSeed() throws Exception {
+        JsonNode v = vectors();
+        byte[] seed = HexFormat.of().parseHex(v.get("seed_hex").asText());
+        KeyPair wrongPrivate = new KeyPair(publicKey(v.get("public_key_hex").asText()),
+                KeyPairGenerator.getInstance("Ed25519").generateKeyPair().getPrivate());
+
+        Credential c = Credential.fromSeed(seed, wrongPrivate);
+        assertEquals(v.get("key_id").asText(), c.keyId());
+        Map<String, String> h = Signer.headers(c, v.get("method").asText(), v.get("path").asText(),
+                v.get("timestamp").asLong(), v.get("body").asText().getBytes(StandardCharsets.UTF_8));
+        assertEquals(v.get("signature_b64").asText(), h.get("X-Turbostats-Signature"));
+    }
+
+    private static PublicKey publicKey(String rawHex) throws Exception {
+        // The fixed X.509 prefix for an Ed25519 public key.
+        byte[] encoded = HexFormat.of().parseHex("302a300506032b6570032100" + rawHex);
+        return KeyFactory.getInstance("Ed25519").generatePublic(new X509EncodedKeySpec(encoded));
     }
 }
