@@ -1,6 +1,7 @@
 package io.turbolytics.turbostats.connect.report;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.turbolytics.turbostats.connect.wire.Bundle;
@@ -178,6 +179,22 @@ class ReporterTest {
         new Reporter(() -> List.of(Fixtures.sourceBundle()), s, log, CLOCK).tick();
         assertTrue(log.warns.get(0).contains("401: timestamp is 7m from this clock"), log.warns.get(0));
         assertTrue(log.warns.get(0).contains("turbostats.key"), log.warns.get(0));
+    }
+
+    // A 403 is the org's plan refusing a task, never the key or the clock:
+    // Control verified the report before it counted it. Pointing at the key
+    // sent operators to rotate a key that worked.
+    @Test
+    void aLimitRefusalNamesTheLimitNotTheKey() {
+        StubSender s = new StubSender();
+        s.status = 403;
+        s.reason = "this org is at its limit of 3 pipelines; e2e/refunds-cdc is not one of them.";
+        RecordingLog log = new RecordingLog();
+        new Reporter(() -> List.of(Fixtures.sourceBundle()), s, log, CLOCK).tick();
+        String warn = log.warns.get(0);
+        assertTrue(warn.contains("403: this org is at its limit of 3 pipelines"), warn);
+        assertFalse(warn.contains("turbostats.key"), warn);
+        assertFalse(warn.contains("clock"), warn);
     }
 
     // A worker with many tasks and a bad key meets the receiver's limit
