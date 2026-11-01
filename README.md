@@ -101,7 +101,7 @@ One report per task, under the id `<cluster>/<connector>/<task>`:
 - The worker's `host:port`, as Connect names the worker.
 - The connector's type and a hash of its config, keyed by your credential. The config itself never leaves the worker: it holds your database password. The keyed hash means nothing outside your install, and cannot be checked against a guessed password.
 
-When a connector is deleted or stopped, or `tasks.max` is lowered, each task that ends sends a final report saying so. A task that moves to another worker continues under the same id.
+When a connector is deleted or stopped, or `tasks.max` is lowered, each task that ends sends a final report saying so. A task that moves to another worker continues under the same id. Its old worker sends a hand-off, so Control reads the move as neither a stop nor a crash. A worker stopped with SIGTERM, as Docker and Kubernetes stop one, hands off every task it runs, and waits up to 3 seconds for Control's answer. A worker killed without SIGTERM sends nothing, and Control counts a crash.
 
 Kafka logs each `turbostats.*` setting as unused, because Connect hands the worker's properties to its own Kafka clients. The line names the setting, never its value:
 

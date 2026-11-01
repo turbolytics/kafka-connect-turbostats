@@ -24,8 +24,9 @@ import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 /**
- * Builds one bundle per task this worker runs, and the exit bundle for a
- * task whose connector was stopped or deleted, or that was removed. Called
+ * Builds one bundle per task this worker runs, the exit bundle for a task
+ * whose connector was stopped or deleted, or that was removed, and the
+ * hand-off for a task that moved or a worker that stops. Called
  * from the reporter's one thread only, so its memory of earlier calls needs
  * no locking.
  */
@@ -158,6 +159,28 @@ public final class TaskCollector {
     }
 
     /**
+     * A task that left this worker without ending: it moved, or this worker
+     * stops. Control ends this worker's run of it as a clean stop, not a
+     * crash, and leaves the task's state to whichever worker runs it next.
+     */
+    private static final Exit HANDED_OFF = new Exit("handed_off", 0);
+
+    /**
+     * The hand-offs of a worker that is shutting down: one for every task it
+     * reported, and for every task that left and still waits for an answer.
+     * Connect continues them on another worker, or here when this one
+     * returns, so none has ended. Each is sent once.
+     */
+    public List<Bundle> handOff(Instant now) {
+        List<Bundle> out = new ArrayList<>();
+        last.values().forEach(b -> out.add(b.withExit(HANDED_OFF, now)));
+        pending.values().forEach(p -> out.add(p.last().withExit(HANDED_OFF, now)));
+        last.clear();
+        pending.clear();
+        return out;
+    }
+
+    /**
      * Interceptors that never ran leave a task without restarts, acknowledged
      * writes, event lag and snapshot progress, and nothing else says so.
      * Strimzi drops interceptor classes from the worker config, and a
@@ -181,13 +204,13 @@ public final class TaskCollector {
 
     private record Decision(Exit exit, boolean settled) {
         static final Decision WAIT = new Decision(null, false);
-        static final Decision MOVED = new Decision(null, true);
     }
 
     /**
      * Why a task left this worker. Deleted, stopped and removed tasks end, and
-     * say so. A task listed on another worker moved, and its new worker
-     * reports it. Anything else, a status store that has not caught up or a
+     * say so. A task listed on another worker moved: this worker hands it
+     * off, and its new worker reports it under the same instance id.
+     * Anything else, a status store that has not caught up or a
      * cluster that cannot answer, waits for a definite answer, up to
      * EXIT_PATIENCE ticks.
      */
@@ -215,7 +238,7 @@ public final class TaskCollector {
         }
         String host = prior.process() == null ? null : prior.process().host();
         if (t.get().workerId() != null && !t.get().workerId().equals(host)) {
-            return Decision.MOVED;
+            return new Decision(HANDED_OFF, true);
         }
         return Decision.WAIT;
     }

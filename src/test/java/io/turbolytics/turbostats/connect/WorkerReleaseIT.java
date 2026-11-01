@@ -30,7 +30,10 @@ import java.util.List;
 import java.util.function.Predicate;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestMethodOrder;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.Network;
 import org.testcontainers.containers.wait.strategy.Wait;
@@ -43,6 +46,7 @@ import org.testcontainers.utility.MountableFile;
  * on the worker classpath, that Connect calls the interceptors, or that a
  * worker's real metrics map onto the contract.
  */
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class WorkerReleaseIT {
     static final ObjectMapper MAPPER = new ObjectMapper();
     static final String KEY = "sfc_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
@@ -345,5 +349,19 @@ class WorkerReleaseIT {
         JsonNode b = body(await(x -> is(x, "itest/gone-cdc/0") && x.has("exit")));
         assertEquals("connector_deleted", b.at("/exit/reason").asText());
         assertEquals("stopped", b.at("/pipeline/state").asText());
+    }
+
+    // A worker stopped as Docker and Kubernetes stop one, with SIGTERM, hands
+    // off its tasks. Without the hand-off, Control reads each stop of a
+    // rolling restart as a crash, and six of them as a crashloop. Runs last:
+    // the worker does not come back.
+    @Test
+    @Order(Integer.MAX_VALUE)
+    void aStoppingWorkerHandsOffItsTasks() throws Exception {
+        rest("PUT", "/connectors/moving-cdc/config", connector("moving-cdc", "postgres"));
+        await(b -> is(b, "itest/moving-cdc/0") && b.at("/pipeline/state").asText().equals("running"));
+        connect.getDockerClient().stopContainerCmd(connect.getContainerId()).withTimeout(60).exec();
+        JsonNode b = body(await(x -> is(x, "itest/moving-cdc/0") && x.has("exit")));
+        assertEquals("handed_off", b.at("/exit/reason").asText());
     }
 }

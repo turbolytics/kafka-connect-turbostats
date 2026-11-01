@@ -143,6 +143,38 @@ class ReporterTest {
         assertEquals(0, log.infos.size());
     }
 
+    // A stopping worker's hand-offs go out at once, each exactly once, even
+    // to a receiver that asked this instance to wait: a hand-off is a last
+    // word, like an exit.
+    @Test
+    void finishSendsEveryHandOff() {
+        StubSender s = new StubSender();
+        s.status = 429;
+        s.retryAfter = 60;
+        Reporter r = new Reporter(() -> List.of(Fixtures.sourceBundle()), s, new RecordingLog(), CLOCK);
+        r.tick();
+        s.status = 200;
+        r.finish(List.of(Fixtures.sourceBundle(), sink()), java.time.Duration.ofSeconds(1));
+        assertEquals(3, s.calls.size());
+    }
+
+    // The worker's shutdown waits on finish, and its tasks still need that
+    // time to stop and commit their offsets. A hung receiver costs it the
+    // wait, no more, and the log says the hand-offs may read as crashes.
+    @Test
+    void finishWaitsNoLongerThanItIsTold() {
+        StubSender s = new StubSender();
+        s.hang = true;
+        RecordingLog log = new RecordingLog();
+        Reporter r = new Reporter(List::of, s, log, CLOCK);
+        long start = System.nanoTime();
+        r.finish(List.of(Fixtures.sourceBundle()), java.time.Duration.ofMillis(200));
+        long took = (System.nanoTime() - start) / 1_000_000;
+        assertTrue(took >= 200 && took < 2000, took + " ms");
+        assertEquals(1, log.warns.size());
+        assertTrue(log.warns.get(0).contains("hand"), log.warns.get(0));
+    }
+
     // A collector that throws must not kill the scheduled thread, or
     // reporting stops for the life of the worker.
     @Test
