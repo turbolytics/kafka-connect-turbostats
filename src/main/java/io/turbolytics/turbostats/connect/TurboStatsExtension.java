@@ -17,7 +17,9 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import org.apache.kafka.common.utils.AppInfoParser;
 import org.apache.kafka.connect.rest.ConnectRestExtension;
 import org.apache.kafka.connect.rest.ConnectRestExtensionContext;
@@ -27,8 +29,8 @@ import org.apache.kafka.connect.rest.ConnectRestExtensionContext;
  *
  * Every method catches everything. An exception from configure or register
  * stops the worker's REST server, and the monitoring jar must never be why
- * a worker or its connectors are down. A worker shutting down sends no exit
- * bundles: its tasks move to another worker, which reports them under the
+ * a worker or its connectors are down. A worker shutting down hands off
+ * its tasks: they move to another worker, which reports them under the
  * same instance ids.
  */
 public final class TurboStatsExtension implements ConnectRestExtension {
@@ -38,6 +40,16 @@ public final class TurboStatsExtension implements ConnectRestExtension {
     private ScheduledExecutorService scheduler;
     private Map<String, ?> worker = Map.of();
     private BrokerLag brokerLag;
+    private TaskCollector collector;
+    private Reporter reporter;
+    private Duration handOffWait;
+
+    /**
+     * The longest a stopping worker waits for its hand-offs. Docker gives a
+     * container 10 s to stop and Kubernetes 30 s, and the tasks need most of
+     * it to stop and commit their offsets.
+     */
+    static final int HAND_OFF_WAIT_SECONDS = 3;
 
     @Override
     public void configure(Map<String, ?> configs) {
@@ -74,7 +86,7 @@ public final class TurboStatsExtension implements ConnectRestExtension {
             Map<String, ?> settings = worker;
             brokerLag = new BrokerLag(() -> new KafkaGroupAdmin(AdminSettings.from(settings)),
                     Duration.ofSeconds(cfg.timeoutSeconds()), LOG::warn);
-            TaskCollector collector = new TaskCollector(
+            collector = new TaskCollector(
                     cfg,
                     new PlatformJmx(),
                     new ConnectClusterView(ctx.clusterState()),
@@ -83,13 +95,14 @@ public final class TurboStatsExtension implements ConnectRestExtension {
                     LOG::warn,
                     brokerLag);
             Sender sender = new Sender(cfg.reportTo(), cfg.credential(), Duration.ofSeconds(cfg.timeoutSeconds()));
-            Reporter reporter = new Reporter(() -> collector.collect(Clock.systemUTC().instant()), sender::send, LOG,
+            reporter = new Reporter(() -> collector.collect(Clock.systemUTC().instant()), sender::send, LOG,
                     Clock.systemUTC());
             scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "turbostats-reporter");
                 t.setDaemon(true);
                 return t;
             });
+            handOffWait = Duration.ofSeconds(Math.min(cfg.timeoutSeconds(), HAND_OFF_WAIT_SECONDS));
             reporter.start(scheduler, cfg.intervalSeconds());
             LOG.info("turbostats: reporting every " + cfg.intervalSeconds() + "s to " + cfg.reportTo()
                     + " as " + cfg.credential() + " for cluster " + cfg.cluster());
@@ -102,6 +115,7 @@ public final class TurboStatsExtension implements ConnectRestExtension {
     public void close() {
         try {
             if (scheduler != null) {
+                handOff();
                 scheduler.shutdownNow();
             }
             if (brokerLag != null) {
@@ -109,6 +123,24 @@ public final class TurboStatsExtension implements ConnectRestExtension {
             }
         } catch (Throwable ignored) {
             // Shutting down; nothing to report to.
+        }
+    }
+
+    /**
+     * Connect closes its REST extensions before it stops the worker's tasks,
+     * so the hand-offs go out while the tasks still run here. They run on
+     * the reporter's thread, the only one the collector allows, after any
+     * tick in progress.
+     */
+    private void handOff() {
+        Future<?> sent = scheduler.submit(
+                () -> reporter.finish(collector.handOff(Clock.systemUTC().instant()), handOffWait));
+        try {
+            sent.get(handOffWait.toMillis() + 1000, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            // A tick that hangs on the cluster or JMX: the worker stops anyway.
         }
     }
 

@@ -327,7 +327,8 @@ class TaskCollectorTest {
     }
 
     // A deleted connector's tasks vanish; its last bundle goes out once
-    // more, stopped, with an exit. A task that moved sends nothing.
+    // more, stopped, with an exit. A task still listed on this worker sends
+    // nothing yet: its status has not caught up.
     @Test
     void aDeletedConnectorSendsAnExitAndAMovedTaskSendsNothing() {
         runningSource(5, 5, 0);
@@ -401,17 +402,48 @@ class TaskCollectorTest {
         assertEquals("task_removed", c.collect(NOW.plusSeconds(60)).get(0).exit().reason());
     }
 
-    // A task now listed on another worker moved: its new worker reports it.
+    // A task now listed on another worker moved: its new worker reports it,
+    // and this one hands it off once. Without the hand-off, Control reads
+    // this worker's silence as a crash, and a rolling restart as a
+    // crashloop.
     @Test
-    void aTaskOnAnotherWorkerSendsNoExit() {
+    void aTaskOnAnotherWorkerSendsAHandOff() {
         runningSource(5, 5, 0);
         TaskCollector c = collector();
         c.collect(NOW);
         jmx.remove(SRC_TASK).remove(SRC_METRICS);
         cluster.tasks.put(SRC, new TaskHealth("RUNNING", "10.0.3.9:8083", "source"));
-        for (int i = 1; i <= 6; i++) {
+        List<Bundle> out = c.collect(NOW.plusSeconds(60));
+        assertEquals(1, out.size());
+        assertEquals("handed_off", out.get(0).exit().reason());
+        assertEquals("prod-connect/inventory-cdc/0", out.get(0).instance().id());
+        for (int i = 2; i <= 6; i++) {
             assertEquals(List.of(), c.collect(NOW.plusSeconds(60L * i)));
         }
+    }
+
+    // A worker shutting down hands off every task it reported, including one
+    // that vanished and still waits for an answer: Connect continues them on
+    // another worker, or on this one when it returns. Each goes once.
+    @Test
+    void aStoppingWorkerHandsOffEveryTaskItReported() {
+        runningSource(5, 5, 0);
+        TaskCollector c = collector();
+        c.collect(NOW);
+        List<Bundle> out = c.handOff(NOW.plusSeconds(5));
+        assertEquals(1, out.size());
+        assertEquals("handed_off", out.get(0).exit().reason());
+        assertEquals(NOW.plusSeconds(5), out.get(0).sentAt());
+        assertEquals(List.of(), c.handOff(NOW.plusSeconds(6)));
+
+        TaskCollector waiting = collector();
+        waiting.collect(NOW);
+        jmx.remove(SRC_TASK).remove(SRC_METRICS);
+        cluster.unreachable.add("inventory-cdc");
+        assertEquals(List.of(), waiting.collect(NOW.plusSeconds(60)));
+        out = waiting.handOff(NOW.plusSeconds(65));
+        assertEquals(1, out.size());
+        assertEquals("handed_off", out.get(0).exit().reason());
     }
 
     // A restart on this worker can straddle a tick: the old task's metrics

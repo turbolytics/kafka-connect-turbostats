@@ -2,6 +2,7 @@ package io.turbolytics.turbostats.connect.report;
 
 import io.turbolytics.turbostats.connect.wire.Bundle;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -123,6 +124,53 @@ public final class Reporter {
         } catch (Throwable t) {
             fail("collecting failed: " + t.getClass().getSimpleName() + ": " + t.getMessage());
             inFlight.set(false);
+        }
+    }
+
+    /**
+     * Sends a stopping worker's hand-offs and waits for their answers, up to
+     * wait: the worker's shutdown waits on this, and its tasks still need
+     * the time to stop and commit their offsets. A hand-off is a last word,
+     * as an exit is, so no Retry-After holds it back.
+     */
+    public void finish(List<Bundle> handOffs, Duration wait) {
+        if (handOffs.isEmpty()) {
+            return;
+        }
+        Instant now = clock.instant();
+        List<CompletableFuture<Failure>> posts = new ArrayList<>();
+        for (Bundle b : handOffs) {
+            CompletableFuture<Sender.Answer> sent;
+            try {
+                sent = sender.send(b, now);
+            } catch (RuntimeException e) {
+                sent = CompletableFuture.failedFuture(e);
+            }
+            posts.add(sent.handle((answer, err) -> err != null
+                    ? new Failure(1, "posting failed: " + cause(err))
+                    : refusal(answer)));
+        }
+        String why = null;
+        try {
+            CompletableFuture.allOf(posts.toArray(new CompletableFuture[0]))
+                    .get(wait.toMillis(), TimeUnit.MILLISECONDS);
+            for (CompletableFuture<Failure> p : posts) {
+                Failure f = p.getNow(null);
+                if (f != null && why == null) {
+                    why = f.why();
+                }
+            }
+        } catch (TimeoutException e) {
+            why = "no answer within " + wait.toMillis() + " ms";
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            why = "interrupted";
+        } catch (ExecutionException e) {
+            why = cause(e);
+        }
+        if (why != null) {
+            log.warn("turbostats: " + handOffs.size() + " hand-offs may not have arrived, so Control may read"
+                    + " this worker's stop as a crash: " + why);
         }
     }
 

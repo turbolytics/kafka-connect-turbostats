@@ -16,7 +16,8 @@ public record Bundle(
     public static final int VERSION = 1;
 
     /**
-     * The final bundle for a task whose connector was stopped or deleted. It
+     * The final bundle this worker sends for a task: its connector was
+     * stopped or deleted, the task was removed, or it was handed off. It
      * repeats the last counts, says stopped, and carries the exit.
      */
     public Bundle withExit(Exit e, Instant at) {

@@ -2,7 +2,7 @@ package io.turbolytics.turbostats.connect.wire;
 
 import io.turbolytics.turbostats.connect.json.JsonObject;
 
-/** How a stopped or deleted connector's task ended. */
+/** How a task's run on this worker ended: stopped, deleted, removed or handed off. */
 public record Exit(String reason, int code) {
 
     public JsonObject toJson() {
