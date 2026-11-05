@@ -125,6 +125,7 @@ class WorkerReleaseIT {
                 .withEnv("CONNECT_TURBOSTATS_REPORT_TO", "http://127.0.0.1:8080/v1/turbostats")
                 .withEnv("CONNECT_TURBOSTATS_KEY", "${env:TURBOSTATS_KEY}")
                 .withEnv("TURBOSTATS_KEY", KEY)
+                .withEnv("SOURCE_HOST", "postgres")
                 .withEnv("CONNECT_TURBOSTATS_CLUSTER", "itest")
                 .withEnv("CONNECT_TURBOSTATS_INTERVAL_SECONDS", "2")
                 .withEnv("CONNECT_TURBOSTATS_TIMEOUT_SECONDS", "1")
@@ -278,6 +279,11 @@ class WorkerReleaseIT {
         assertTrue(s.at("/pipeline/source_connected").asBoolean());
         assertTrue(s.at("/pipeline/sink_wire_bytes").asLong() > 0);
         assertTrue(s.at("/pipeline/event_lag_seconds").asDouble(-1) >= 0);
+        assertEquals("postgres", s.at("/pipeline/source/kind").asText());
+        assertEquals("postgres", s.at("/pipeline/source/host").asText());
+        assertEquals(5432, s.at("/pipeline/source/port").asInt());
+        assertEquals("postgres", s.at("/pipeline/source/database").asText());
+        assertEquals("inventory_cdc", s.at("/pipeline/source/slot").asText());
         try (InputStream in = getClass().getResourceAsStream("/schema/bundle.schema.json")) {
             JsonSchema schema = JsonSchemaFactory.getInstance(SpecVersion.VersionFlag.V202012).getSchema(in);
             assertEquals(0, schema.validate(s).size(), schema.validate(s).toString());
@@ -339,6 +345,21 @@ class WorkerReleaseIT {
         rest("POST", "/connectors/restart-cdc/tasks/0/restart", null);
         JsonNode b = body(await(x -> is(x, "itest/restart-cdc/0") && x.at("/pipeline/restart_count").asLong() >= 1));
         assertEquals(1, b.at("/pipeline/restart_count").asLong());
+    }
+
+    // Connect resolves a provider's value for the connector and hands this reporter
+    // the raw config, so the value never reaches the wire. If Connect ever hands over
+    // the resolved value, this fails, and the README's promise with it. The connector
+    // running is the proof the provider resolved at all.
+    @Test
+    void aConfigProviderValueIsNeverSent() throws Exception {
+        rest("PUT", "/connectors/provider-cdc/config", connector("provider-cdc", "postgres")
+                .replace("\"database.hostname\":\"postgres\"", "\"database.hostname\":\"${env:SOURCE_HOST}\""));
+        JsonNode b = body(await(x -> is(x, "itest/provider-cdc/0") && x.at("/pipeline/state").asText().equals("running")));
+        assertEquals("postgres", b.at("/pipeline/source/kind").asText());
+        assertTrue(b.at("/pipeline/source/host").isMissingNode(), b.toString());
+        assertEquals("provider_cdc", b.at("/pipeline/source/slot").asText());
+        assertEquals("postgres", b.at("/pipeline/source/database").asText());
     }
 
     @Test

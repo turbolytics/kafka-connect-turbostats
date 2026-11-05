@@ -8,6 +8,7 @@ import io.turbolytics.turbostats.connect.config.ReporterConfig;
 import io.turbolytics.turbostats.connect.intercept.AckInterceptor;
 import io.turbolytics.turbostats.connect.intercept.TaskCounters;
 import io.turbolytics.turbostats.connect.wire.Bundle;
+import io.turbolytics.turbostats.connect.wire.Source;
 import io.turbolytics.turbostats.connect.wire.BundleSchemaTest;
 import io.turbolytics.turbostats.connect.wire.Fixtures;
 import java.time.Instant;
@@ -60,7 +61,11 @@ class TaskCollectorTest {
             return connector.equals("customers-sink")
                     ? Map.of("connector.class", "io.debezium.connector.jdbc.JdbcSinkConnector")
                     : Map.of("connector.class", "io.debezium.connector.postgresql.PostgresConnector",
-                            "topic.prefix", "inventory");
+                            "topic.prefix", "inventory",
+                            "database.hostname", "db.internal",
+                            "database.dbname", "billing",
+                            "database.password", "hunter2",
+                            "slot.name", "debezium_billing");
         }
     }
 
@@ -144,6 +149,37 @@ class TaskCollectorTest {
         assertEquals(Boolean.TRUE, b.pipeline().sourceConnected());
         assertEquals(NOW.minusMillis(5000), b.pipeline().lastMessageAt());
         assertEquals(4096L, b.pipeline().sinkWireBytes());
+    }
+
+    // The source reaches the bundle, so Control can find the slot it holds. The
+    // config beside it holds a password, which never does.
+    @Test
+    void aDebeziumSourceNamesWhatItReads() {
+        runningSource(10, 10, 0);
+        Bundle b = collector().collect(NOW).get(0);
+        assertEquals(new Source("postgres", "db.internal", 5432L, "billing", "debezium_billing"),
+                b.pipeline().source());
+        String json = b.toJson();
+        org.junit.jupiter.api.Assertions.assertTrue(json.contains("\"slot\":\"debezium_billing\""), json);
+        org.junit.jupiter.api.Assertions.assertFalse(json.contains("hunter2"), json);
+    }
+
+    // A task's final report still says what it held, because the slot outlives it.
+    @Test
+    void aFinalStateKeepsTheSource() {
+        runningSource(10, 10, 0);
+        Bundle b = collector().collect(NOW).get(0);
+        assertEquals("stopped", b.pipeline().withState("stopped").state());
+        assertEquals(b.pipeline().source(), b.pipeline().withState("stopped").source());
+        org.junit.jupiter.api.Assertions.assertNotNull(b.pipeline().withState("stopped").source());
+    }
+
+    // A config the reporter can't fetch is unknown, so no source is sent.
+    @Test
+    void aSourceWithoutItsConfigNamesNothing() {
+        cluster.configUnavailable = true;
+        runningSource(10, 10, 0);
+        org.junit.jupiter.api.Assertions.assertNull(collector().collect(NOW).get(0).pipeline().source());
     }
 
     // A Debezium source always sends backfill; without metrics it is unknown.

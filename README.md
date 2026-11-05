@@ -99,7 +99,8 @@ One report per task, under the id `<cluster>/<connector>/<task>`:
 - Bytes the task's Kafka client sent or fetched.
 - The worker's uptime, memory, garbage collections and container limit.
 - The worker's `host:port`, as Connect names the worker.
-- The connector's type and a hash of its config, keyed by your credential. The config itself never leaves the worker: it holds your database password. The keyed hash means nothing outside your install, and cannot be checked against a guessed password.
+- For a Debezium Postgres connector, four values from its config, so Control can find the replication slot it holds: `database.hostname`, `database.port`, `database.dbname` and `slot.name`, with Debezium's defaults for the port and the slot. **Your database's hostname leaves the worker.** A value is left out when it uses a config provider such as `${file:...}`, or when its shape could carry anything else, such as a `dbname` holding `?password=`.
+- The connector's type and a hash of its config, keyed by your credential. No other config value leaves the worker: the config holds your database password. The keyed hash means nothing outside your install, and cannot be checked against a guessed password.
 
 When a connector is deleted or stopped, or `tasks.max` is lowered, each task that ends sends a final report saying so. A task that moves to another worker continues under the same id. Its old worker sends a hand-off, so Control reads the move as neither a stop nor a crash. A worker stopped with SIGTERM, as Docker and Kubernetes stop one, hands off every task it runs, and waits up to 3 seconds for Control's answer. A worker killed without SIGTERM sends nothing, and Control counts a crash.
 

@@ -36,13 +36,14 @@ public record Pipeline(
         Boolean sourceConnected,
         Long sourceWireBytes,
         Long sinkWireBytes,
-        Long messagePayloadBytes) {
+        Long messagePayloadBytes,
+        Source source) {
 
     public Pipeline withState(String newState) {
         return new Pipeline(newState, startedAt, restartCount, messageCount, handlerRowsRead, errorCount,
                 sinkFlushCount, sinkRowsAccepted, sinkRowsWritten, stateCommitCount, lastMessageAt,
                 lastSinkWriteAt, lastErrorAt, lastErrorCode, errorRowsDropped, dlqRows, eventLag, messageLag, backfill,
-                sourceConnected, sourceWireBytes, sinkWireBytes, messagePayloadBytes);
+                sourceConnected, sourceWireBytes, sinkWireBytes, messagePayloadBytes, source);
     }
 
     public JsonObject toJson() {
@@ -73,6 +74,7 @@ public record Pipeline(
                 .put("source_connected", sourceConnected)
                 .put("source_wire_bytes", sourceWireBytes)
                 .put("sink_wire_bytes", sinkWireBytes)
-                .put("message_payload_bytes", messagePayloadBytes);
+                .put("message_payload_bytes", messagePayloadBytes)
+                .put("source", source == null ? null : source.toJson());
     }
 }
