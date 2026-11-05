@@ -10,6 +10,6 @@ public interface ClusterView {
     /** The connector's state, or whether it was not found, or no answer. */
     ConnectorLookup connector(String connector);
 
-    /** The connector's config, empty when unknown. Holds secrets: hash it, never send it. */
+    /** The connector's config, empty when unknown. Holds secrets: hash it, and send only what DebeziumSource names. */
     Map<String, String> config(String connector);
 }

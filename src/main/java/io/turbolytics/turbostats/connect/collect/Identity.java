@@ -63,8 +63,8 @@ public final class Identity {
 
     /**
      * HMAC-SHA256 over the sorted key=value lines, keyed by the install's
-     * credential. The config carries secrets in plain text, so only the hash
-     * leaves the worker; it still changes when any setting does, which is
+     * credential. The config carries secrets in plain text, so the hash stands in
+     * for the whole of it; it still changes when any setting does, which is
      * what a receiver needs. Keyed, it means nothing outside this install,
      * and nobody without the credential can test a guessed password
      * against it.

@@ -34,6 +34,15 @@ public class BundleSchemaTest {
         assertEquals(Set.of(), validate(Fixtures.sourceBundle().toJson()));
     }
 
+    // The test schema is the receiver's contract. A string port would pass a schema
+    // that doesn't know source, then fail the whole report's decode at the receiver.
+    @Test
+    void aStringPortDoesNotValidate() throws Exception {
+        String good = Fixtures.sourceBundle().toJson();
+        org.junit.jupiter.api.Assertions.assertTrue(good.contains("\"port\":5432"), good);
+        org.junit.jupiter.api.Assertions.assertFalse(validate(good.replace("\"port\":5432", "\"port\":\"5432\"")).isEmpty());
+    }
+
     @Test
     void aSinkTaskBundleValidates() throws Exception {
         assertEquals(Set.of(), validate(Fixtures.sinkBundle().toJson()));

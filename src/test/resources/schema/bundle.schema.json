@@ -232,6 +232,34 @@
           ],
           "description": "Backfill is present for a source that can backfill. See Backfill."
         },
+        "source": {
+          "properties": {
+            "kind": {
+              "type": "string",
+              "description": "Kind is the database's kind: postgres."
+            },
+            "host": {
+              "type": "string"
+            },
+            "port": {
+              "type": "integer",
+              "description": "Port is a JSON integer. A value that does not parse as one is absent: a\nstring here fails the whole report's decode, not just this field."
+            },
+            "database": {
+              "type": "string",
+              "description": "Database is the database the pipeline reads, not the server."
+            },
+            "slot": {
+              "type": "string",
+              "description": "Slot is the replication slot the pipeline holds on that server."
+            }
+          },
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "description": "Source is the database this pipeline reads, from its config. A receiver\njoins it to the database's own reports. Absent for a pipeline that reads\nno database, and from engines that predate it. See PipelineSource."
+        },
         "message_count": {
           "type": "integer"
         },
@@ -618,6 +646,17 @@
               "required": [
                 "shared_buffers_bytes"
               ]
+            },
+            "table_count": {
+              "type": "integer",
+              "description": "TableCount is the tables in the database's own schemas, partitions\nincluded; the system catalogs are not counted. PartitionCount is how\nmany of them are partitions. A table partitioned by day adds one a\nday until retention drops one, so a PartitionCount that keeps\nclimbing is retention that stopped."
+            },
+            "partition_count": {
+              "type": "integer"
+            },
+            "wal_bytes": {
+              "type": "integer",
+              "description": "WALBytes is the write-ahead log on disk for the whole server, which\nSizeBytes does not count. A replication slot that stops advancing\ngrows it until the disk fills."
             }
           },
           "type": "object"
@@ -653,6 +692,56 @@
               "checked_at": {
                 "type": "string",
                 "format": "date-time"
+              },
+              "dead_rows": {
+                "type": "integer",
+                "description": "DeadRows is rows deleted or updated and not yet reclaimed."
+              },
+              "seq_scans_per_second": {
+                "type": "number",
+                "description": "SeqScansPerSecond is whole-table reads; IndexScansPerSecond the rest.\nRates over the interval, absent on the first and after a reset."
+              },
+              "index_scans_per_second": {
+                "type": "number"
+              },
+              "schema_hash": {
+                "type": "string",
+                "description": "SchemaHash is a hash of the table's columns: each name, type and\nnullability, in column order. The same every report until the\nschema moves; a receiver that sees it change knows the table changed\nshape, and SchemaChanges, sent in that report alone, says how. A\nreporter that has no previous reading, having just started, sends\nthe hash without changes."
+              },
+              "schema_changes": {
+                "items": {
+                  "properties": {
+                    "column": {
+                      "type": "string"
+                    },
+                    "change": {
+                      "type": "string"
+                    },
+                    "from": {
+                      "type": "string"
+                    },
+                    "to": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object",
+                  "required": [
+                    "column",
+                    "change"
+                  ],
+                  "description": "DatabaseSchemaChange is one column's change between two readings of a table's schema: added, dropped, retyped or nullability."
+                },
+                "type": "array"
+              },
+              "rows_inserted_per_second": {
+                "type": "number",
+                "description": "RowsInsertedPerSecond, RowsUpdatedPerSecond and RowsDeletedPerSecond\nare the table's writes over the interval from the system's own\ncounters: what the table's volume did, exactly, not what an estimate\nsays it is. Absent on the first interval and after a reset."
+              },
+              "rows_updated_per_second": {
+                "type": "number"
+              },
+              "rows_deleted_per_second": {
+                "type": "number"
               }
             },
             "type": "object",
@@ -703,12 +792,161 @@
               },
               "type": "array",
               "description": "Replicas is a primary's view of each replica."
+            },
+            "slots": {
+              "items": {
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string",
+                    "description": "Type is logical or physical."
+                  },
+                  "plugin": {
+                    "type": "string",
+                    "description": "Plugin is a logical slot's decoding plugin. Database is the database\na logical slot reads."
+                  },
+                  "database": {
+                    "type": "string"
+                  },
+                  "active": {
+                    "type": "boolean",
+                    "description": "Active is whether a consumer is connected."
+                  },
+                  "wal_status": {
+                    "type": "string",
+                    "description": "WALStatus is the system's word for the WAL the slot needs: for\nPostgres reserved, extended, unreserved or lost. Lost means the slot\ncan no longer serve its consumer."
+                  },
+                  "retained_bytes": {
+                    "type": "integer",
+                    "description": "RetainedBytes is the WAL the slot keeps on disk, from its restart\nposition to the server's current position."
+                  },
+                  "behind_bytes": {
+                    "type": "integer",
+                    "description": "BehindBytes is the WAL the consumer has not confirmed, from its\nconfirmed position to the server's current position. A physical slot\nhas no confirmed position and leaves it out."
+                  },
+                  "safe_wal_bytes": {
+                    "type": "integer",
+                    "description": "SafeWALBytes is the WAL the server can write before the slot is at\nrisk of losing what it needs. Absent when the server sets no limit."
+                  }
+                },
+                "type": "object",
+                "required": [
+                  "name",
+                  "type",
+                  "active"
+                ],
+                "description": "DatabaseReplicationSlot is one replication slot and the WAL it holds."
+              },
+              "type": "array",
+              "description": "Slots is a primary's replication slots, for the whole server, the\nones holding the most WAL first. A consumer that stops leaves\nReplicas but stays here, still holding WAL."
             }
           },
           "type": "object",
           "required": [
             "role"
           ]
+        },
+        "load": {
+          "properties": {
+            "sessions_active_now": {
+              "type": "integer",
+              "description": "SessionsActiveNow is sessions executing a statement."
+            },
+            "sessions_idle_in_transaction_now": {
+              "type": "integer"
+            },
+            "sessions_waiting_now": {
+              "type": "integer",
+              "description": "SessionsWaitingNow is sessions blocked: on a lock, a queue, a resource."
+            },
+            "queries_queued_now": {
+              "type": "integer",
+              "description": "QueriesQueuedNow is queries waiting to start; warehouses and WLM."
+            },
+            "longest_query_seconds": {
+              "type": "number",
+              "description": "LongestQuerySeconds is the age of the oldest statement still running."
+            },
+            "queries_per_second": {
+              "type": "number"
+            },
+            "transactions_per_second": {
+              "type": "number"
+            },
+            "rollbacks_per_second": {
+              "type": "number"
+            },
+            "rows_read_per_second": {
+              "type": "number",
+              "description": "RowsReadPerSecond is rows returned to clients."
+            },
+            "rows_written_per_second": {
+              "type": "number",
+              "description": "RowsWrittenPerSecond is inserted, updated and deleted."
+            },
+            "bytes_scanned_per_second": {
+              "type": "number",
+              "description": "BytesScannedPerSecond is storage read to answer queries."
+            },
+            "cache_hit_ratio": {
+              "type": "number",
+              "description": "CacheHitRatio is the interval's block or page reads served from\nmemory, 0..1; not since the server started."
+            },
+            "deadlocks_per_second": {
+              "type": "number"
+            },
+            "temp_bytes_per_second": {
+              "type": "number",
+              "description": "TempBytesPerSecond is sorts and hashes spilling to disk."
+            },
+            "wal_bytes_per_second": {
+              "type": "number",
+              "description": "WALBytesPerSecond is the write-ahead log the server wrote. Compared\nwith a slot's RetainedBytes, it says whether a slot keeps up."
+            }
+          },
+          "type": "object",
+          "description": "Load is what people are doing to the database. Present when the kind\nprovides at least one field."
+        },
+        "queries": {
+          "items": {
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "ID is the system's query id, or a hash of the text, stable across\nintervals for the same shape."
+              },
+              "text": {
+                "type": "string",
+                "description": "Text is the normalized form, literals replaced, at most\nMaxDatabaseQueryText bytes."
+              },
+              "calls_per_second": {
+                "type": "number"
+              },
+              "mean_ms": {
+                "type": "number"
+              },
+              "time_share": {
+                "type": "number",
+                "description": "TimeShare is this shape's share of all query time in the interval, 0..1."
+              },
+              "rows_per_call": {
+                "type": "number"
+              }
+            },
+            "type": "object",
+            "required": [
+              "id",
+              "text",
+              "calls_per_second",
+              "mean_ms",
+              "time_share",
+              "rows_per_call"
+            ],
+            "description": "DatabaseQuery is one query shape's share of the interval's work."
+          },
+          "type": "array",
+          "description": "Queries is the work by query, opt-in, at most MaxDatabaseQueries,\nordered by TimeShare descending."
         },
         "collection": {
           "properties": {

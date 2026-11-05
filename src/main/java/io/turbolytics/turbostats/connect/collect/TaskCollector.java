@@ -11,6 +11,7 @@ import io.turbolytics.turbostats.connect.wire.Instance;
 import io.turbolytics.turbostats.connect.wire.MessageLag;
 import io.turbolytics.turbostats.connect.wire.Pipeline;
 import io.turbolytics.turbostats.connect.wire.ProcessInfo;
+import io.turbolytics.turbostats.connect.wire.Source;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -81,7 +82,7 @@ public final class TaskCollector {
      * change. topicPrefix names its Debezium metrics, when debezium is set.
      */
     private record ConnectorFacts(String configHash, String type, String topicPrefix, boolean debezium,
-            String group, long fetchedAt) {
+            String group, Source source, long fetchedAt) {
     }
 
     public TaskCollector(ReporterConfig config, Jmx jmx, ClusterView cluster,
@@ -447,7 +448,8 @@ public final class TaskCollector {
                 // The same records message_count counts, so the two divide to
                 // an average size. A source's poll count is records before
                 // conversion, which have no size yet.
-                sink ? counters.map(TaskCounters.Snapshot::payloadBytes).orElse(null) : null);
+                sink ? counters.map(TaskCounters.Snapshot::payloadBytes).orElse(null) : null,
+                sink || f == null ? null : f.source());
 
         return new Bundle(now, config.intervalSeconds(), lastMessage, instance, jvm.withHost(h.workerId()), pipeline,
                 null);
@@ -539,6 +541,7 @@ public final class TaskCollector {
                 prefix != null && cls != null && cls.startsWith("io.debezium.connector.")
                         && !cls.startsWith("io.debezium.connector.jdbc."),
                 c.get("consumer.override.group.id"),
+                DebeziumSource.of(c),
                 tick);
         facts.put(connector, fresh);
         return fresh;
