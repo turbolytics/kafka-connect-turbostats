@@ -157,7 +157,7 @@ class TaskCollectorTest {
     void aDebeziumSourceNamesWhatItReads() {
         runningSource(10, 10, 0);
         Bundle b = collector().collect(NOW).get(0);
-        assertEquals(new Source("postgres", "db.internal", 5432L, "billing", "debezium_billing"),
+        assertEquals(new Source("postgres", "db.internal", 5432L, "billing", "debezium_billing", "connector", 0L, false),
                 b.pipeline().source());
         String json = b.toJson();
         org.junit.jupiter.api.Assertions.assertTrue(json.contains("\"slot\":\"debezium_billing\""), json);
