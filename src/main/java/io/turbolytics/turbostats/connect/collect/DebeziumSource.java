@@ -11,6 +11,11 @@ import java.util.regex.Pattern;
  * enough for the receiver to find the replication slot it holds. A config holds
  * passwords, so this reads these four fields by name and nothing else, and sends a
  * value only when its shape can't carry anything but what it names.
+ *
+ * <p>It also reads the settings that decide whether the slot advances while the tables
+ * it captures are quiet: lsn.flush.mode, or flush.lsn.source before 3.4, the heartbeat's
+ * interval, and whether a heartbeat query is set. A setting it cannot read is absent,
+ * never Debezium's default, which would name the wrong fix.
  */
 public final class DebeziumSource {
     // Connect accepts a class's full name, its simple name, or that less "Connector".
@@ -19,6 +24,7 @@ public final class DebeziumSource {
     // Debezium's defaults, which the connector really uses when these are unset.
     private static final String DEFAULT_PORT = "5432";
     private static final String DEFAULT_SLOT = "debezium";
+    private static final Set<String> FLUSH_MODES = Set.of("connector", "connector_and_driver", "manual");
     // What each value can be. Debezium builds its JDBC URL by substituting them, so a
     // dbname can carry a password and still connect, and shape is the only guard on
     // what is inside a value read by name.
@@ -45,7 +51,54 @@ public final class DebeziumSource {
                 host != null && HOST.matcher(host).matches() ? host : null,
                 port(config.getOrDefault("database.port", DEFAULT_PORT)),
                 database != null && !NOT_A_DATABASE.matcher(database).find() ? database : null,
-                slot != null && SLOT.matcher(slot).matches() ? slot : null);
+                slot != null && SLOT.matcher(slot).matches() ? slot : null,
+                flushMode(config), heartbeat(config.get("heartbeat.interval.ms")),
+                actionQuery(config.get("heartbeat.action.query")));
+    }
+
+    /**
+     * Debezium's lsn.flush.mode. When it is unset, 3.4 reads the deprecated
+     * flush.lsn.source, as every version before 3.4 did: true, the default, is
+     * connector, and false is manual.
+     */
+    private static String flushMode(Map<String, String> config) {
+        String mode = config.get("lsn.flush.mode");
+        if (mode != null && !mode.isBlank()) {
+            String v = readable(mode, MAX_NAME);
+            return v != null && FLUSH_MODES.contains(v.toLowerCase(java.util.Locale.ROOT))
+                    ? v.toLowerCase(java.util.Locale.ROOT) : null;
+        }
+        String source = config.get("flush.lsn.source");
+        if (source == null || source.isBlank()) {
+            return "connector";
+        }
+        String v = readable(source, MAX_NAME);
+        if ("true".equalsIgnoreCase(v)) {
+            return "connector";
+        }
+        return "false".equalsIgnoreCase(v) ? "manual" : null;
+    }
+
+    /** Milliseconds between heartbeats. Unset is Debezium's default, 0, which is off. */
+    private static Long heartbeat(String value) {
+        if (value == null || value.isBlank()) {
+            return 0L;
+        }
+        String v = readable(value, MAX_NAME);
+        if (v == null) {
+            return null;
+        }
+        try {
+            long ms = Long.parseLong(v);
+            return ms >= 0 ? ms : null;
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /** Whether a heartbeat query is set. The query itself never leaves: it can carry anything. */
+    private static Boolean actionQuery(String value) {
+        return value != null && !value.isBlank();
     }
 
     /**

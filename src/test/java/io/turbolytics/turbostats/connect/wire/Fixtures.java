@@ -53,7 +53,8 @@ public final class Fixtures {
                         null,
                         412_000L,
                         null,
-                        new Source("postgres", "db.internal", 5432L, "billing", "debezium_billing")),
+                        new Source("postgres", "db.internal", 5432L, "billing", "debezium_billing",
+                                "connector_and_driver", 10000L, true)),
                 null);
     }
 

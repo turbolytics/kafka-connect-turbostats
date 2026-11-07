@@ -1,6 +1,7 @@
 package io.turbolytics.turbostats.connect;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -360,6 +361,22 @@ class WorkerReleaseIT {
         assertTrue(b.at("/pipeline/source/host").isMissingNode(), b.toString());
         assertEquals("provider_cdc", b.at("/pipeline/source/slot").asText());
         assertEquals("postgres", b.at("/pipeline/source/database").asText());
+    }
+
+    // On a real worker: the settings that decide whether the slot advances arrive,
+    // and a heartbeat query's text never leaves, only that one is set.
+    @Test
+    void theSlotSettingsArriveAndAHeartbeatQueryNeverLeaves() throws Exception {
+        rest("PUT", "/connectors/heartbeat-cdc/config", connector("heartbeat-cdc", "postgres")
+                .replace("\"tasks.max\":\"1\"}", "\"tasks.max\":\"1\",\"heartbeat.interval.ms\":\"10000\","
+                        + "\"heartbeat.action.query\":\"SELECT 'itest-query-marker'\"}"));
+        JsonNode b = body(await(x -> is(x, "itest/heartbeat-cdc/0") && x.at("/pipeline/source").has("kind")));
+        assertEquals("connector", b.at("/pipeline/source/lsn_flush_mode").asText(), b.toString());
+        assertEquals(10000, b.at("/pipeline/source/heartbeat_interval_ms").asLong(), b.toString());
+        assertTrue(b.at("/pipeline/source/heartbeat_action_query").asBoolean(), b.toString());
+        for (JsonNode post : posts()) {
+            assertFalse(post.toString().contains("itest-query-marker"), "a post carries the heartbeat query");
+        }
     }
 
     @Test

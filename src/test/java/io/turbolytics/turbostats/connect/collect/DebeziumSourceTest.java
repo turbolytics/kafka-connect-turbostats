@@ -1,8 +1,10 @@
 package io.turbolytics.turbostats.connect.collect;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.turbolytics.turbostats.connect.wire.Source;
 import java.util.HashMap;
@@ -24,8 +26,8 @@ class DebeziumSourceTest {
 
     @Test
     void namesThePostgresSource() {
-        assertEquals(new Source("postgres", "db.internal", 5433L, "billing", "debezium_billing"),
-                DebeziumSource.of(config()));
+        assertEquals(new Source("postgres", "db.internal", 5433L, "billing", "debezium_billing",
+                "connector", 0L, false), DebeziumSource.of(config()));
     }
 
     // Debezium applies these defaults, so the connector really uses them. Leaving
@@ -189,7 +191,8 @@ class DebeziumSourceTest {
         c.put("table.include.list", "public.invoices");
         String json = DebeziumSource.of(c).toJson().toJson();
         assertEquals("{\"kind\":\"postgres\",\"host\":\"db.internal\",\"port\":5433,"
-                + "\"database\":\"billing\",\"slot\":\"debezium_billing\"}", json);
+                + "\"database\":\"billing\",\"slot\":\"debezium_billing\",\"lsn_flush_mode\":\"connector\","
+                + "\"heartbeat_interval_ms\":0,\"heartbeat_action_query\":false}", json);
     }
 
     @Test
@@ -197,7 +200,88 @@ class DebeziumSourceTest {
         Map<String, String> c = config();
         c.put("database.hostname", "${env:HOST}");
         c.put("database.port", "abc");
-        assertEquals("{\"kind\":\"postgres\",\"database\":\"billing\",\"slot\":\"debezium_billing\"}",
+        assertEquals("{\"kind\":\"postgres\",\"database\":\"billing\",\"slot\":\"debezium_billing\","
+                + "\"lsn_flush_mode\":\"connector\",\"heartbeat_interval_ms\":0,\"heartbeat_action_query\":false}",
                 DebeziumSource.of(c).toJson().toJson());
+    }
+
+    // Unset, Debezium confirms only what it captures and sends no heartbeat: the
+    // settings that hold WAL while the captured tables are quiet. They are sent, so
+    // Control can say the connector is on them.
+    @Test
+    void sendsDebeziumsDefaultSettings() {
+        Source s = DebeziumSource.of(config());
+        assertEquals("connector", s.lsnFlushMode());
+        assertEquals(0L, s.heartbeatIntervalMs());
+        assertEquals(false, s.heartbeatActionQuery());
+    }
+
+    @Test
+    void sendsTheSettingsItIsGiven() {
+        Map<String, String> c = config();
+        c.put("lsn.flush.mode", "connector_and_driver");
+        c.put("heartbeat.interval.ms", "10000");
+        c.put("heartbeat.action.query", "INSERT INTO heartbeat VALUES (now())");
+        Source s = DebeziumSource.of(c);
+        assertEquals("connector_and_driver", s.lsnFlushMode());
+        assertEquals(10000L, s.heartbeatIntervalMs());
+        assertEquals(true, s.heartbeatActionQuery());
+    }
+
+    // Before 3.4, flush.lsn.source chose the mode, and 3.4 still reads it when
+    // lsn.flush.mode is unset.
+    @Test
+    void theOlderSettingNamesTheMode() {
+        Map<String, String> c = config();
+        c.put("flush.lsn.source", "false");
+        assertEquals("manual", DebeziumSource.of(c).lsnFlushMode());
+        c.put("flush.lsn.source", "TRUE");
+        assertEquals("connector", DebeziumSource.of(c).lsnFlushMode());
+        c.put("lsn.flush.mode", "connector_and_driver");
+        assertEquals("connector_and_driver", DebeziumSource.of(c).lsnFlushMode());
+    }
+
+    // A setting the reporter cannot read is absent, never Debezium's default: a
+    // default here would tell an operator the wrong fix.
+    @Test
+    void aSettingItCannotReadIsAbsent() {
+        Map<String, String> c = config();
+        c.put("lsn.flush.mode", "${file:/secrets/debezium.properties:mode}");
+        c.put("heartbeat.interval.ms", "${env:HEARTBEAT}");
+        Source s = DebeziumSource.of(c);
+        assertNull(s.lsnFlushMode());
+        assertNull(s.heartbeatIntervalMs());
+        for (String[] bad : new String[][] {{"lsn.flush.mode", "fast"}, {"heartbeat.interval.ms", "ten"},
+                {"heartbeat.interval.ms", "-1"}, {"flush.lsn.source", "maybe"}}) {
+            Map<String, String> b = config();
+            b.put(bad[0], bad[1]);
+            Source got = DebeziumSource.of(b);
+            assertNull(bad[0].equals("heartbeat.interval.ms") ? got.heartbeatIntervalMs() : got.lsnFlushMode(),
+                    bad[0] + "=" + bad[1]);
+            assertEquals("billing", got.database(), "the rest of the source stays");
+        }
+    }
+
+    // A mode's case doesn't change what Debezium runs.
+    @Test
+    void aModeInAnyCaseIsTheMode() {
+        Map<String, String> c = config();
+        c.put("lsn.flush.mode", " Connector_And_Driver ");
+        assertEquals("connector_and_driver", DebeziumSource.of(c).lsnFlushMode());
+    }
+
+    // The query can carry anything, so only whether it is set leaves the worker,
+    // even when it sits behind a config provider. A blank one is unset.
+    @Test
+    void theQueryNeverLeaves() {
+        Map<String, String> c = config();
+        c.put("heartbeat.action.query", "UPDATE secrets SET v = 'hunter2'");
+        String json = DebeziumSource.of(c).toJson().toJson();
+        assertTrue(json.contains("\"heartbeat_action_query\":true"), json);
+        assertFalse(json.contains("hunter2") || json.contains("secrets"), json);
+        c.put("heartbeat.action.query", "${file:/secrets/q.properties:q}");
+        assertEquals(true, DebeziumSource.of(c).heartbeatActionQuery());
+        c.put("heartbeat.action.query", "  ");
+        assertEquals(false, DebeziumSource.of(c).heartbeatActionQuery());
     }
 }
